@@ -1,0 +1,7 @@
+1) Fade big market Speeds (Points/sec)
+2) Fade big market divergences between Spx, Nas, Us30 etc, maxybe even look at individual weightings
+3 Some kind of trend following approach?
+
+
+General idea: Weight used sizes of either of those approaches dynamically?
+AI verwenden, um parameter der Strategien live zu verändern? Wann merh gewicht auf TrendFOllowing etc?

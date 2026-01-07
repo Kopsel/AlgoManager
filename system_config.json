@@ -1,0 +1,60 @@
+{
+  "system": {
+    "zmq_host": "localhost",
+    "zmq_port": 5555,
+    "mt5_terminal_path": "E:\\FusionMarketsMT5\\terminal64.exe",
+    "authorized_account_number": 254014
+  },
+  "risk_management": {
+    "basket_enabled": false,
+    "basket_take_profit_usd": 100000.0,
+    "basket_stop_loss_usd": -100000.0
+  },
+  "strategies": {
+    "SPEED_US500_01": {
+      "enabled": true,
+      "script": "SignalEngines/Signal_Velocity.py",
+      "magic_number": 33333,
+      "symbol": "US500",
+      "volume": 0.01,
+      "parameters": {
+        "time_window_sec": 2,
+        "cooldown_sec": 5,
+        "use_dynamic_threshold": false,
+        "fallback_threshold": 0.25,
+        "use_rsi_filter": true,
+        "rsi_period": 14,
+        "rsi_upper": 65,
+        "rsi_lower": 35,
+        "rsi_timeframe": "M1",
+        "calibration": {
+          "lookback_days": 5,
+          "percentile": 0.99
+        }
+      },
+      "trade_limits": {
+        "sl_points": 0,
+        "tp_points": 1.0,
+        "use_volatility_based_tp": true,
+        "volatility_lookback_sec": 60,
+        "tp_volatility_multiplier": 0.5,
+        "min_tp_points": 0.5,
+        "max_tp_points": 5.0
+      }
+    },
+    "TREND_TEST_01": {
+      "enabled": true,
+      "script": "SignalEngines/Signal_TrendTest.py",
+      "magic_number": 55555,
+      "symbol": "US500",
+      "volume": 0.01,
+      "parameters": {
+        "dummy_param": 0
+      },
+      "trade_limits": {
+        "sl_points": 0,
+        "tp_points": 2.0
+      }
+    }
+  }
+}

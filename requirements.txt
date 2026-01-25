@@ -1,0 +1,8 @@
+MetaTrader5
+pyzmq
+pandas
+numpy
+streamlit
+plotly
+pandas_ta
+scipy

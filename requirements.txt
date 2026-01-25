@@ -6,3 +6,4 @@ streamlit
 plotly
 pandas_ta
 scipy
+streamlit-lightweight-charts

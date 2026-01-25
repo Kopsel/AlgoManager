@@ -1,0 +1,35 @@
+# --- Project Specific ---
+*.db
+trading_system.db
+*.sqlite3
+
+# Ignore Logs and temporary outputs
+*.log
+/logs
+
+
+# --- Python Standard ---
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+venv/
+env/
+.venv/
+.env
+
+# --- Streamlit ---
+# Streamlit secrets (if you ever use them)
+.streamlit/secrets.toml
+
+# --- IDE / Editor Settings ---
+# VS Code
+.vscode/
+
+# PyCharm
+.idea/
+
+# Mac OS specific
+.DS_Store

@@ -20,8 +20,8 @@
       "parameters": {
         "time_window_sec": 2,
         "cooldown_sec": 5,
-        "use_dynamic_threshold": false,
-        "fallback_threshold": 0.25,
+        "use_dynamic_threshold": true,
+        "fallback_threshold": 0.5,
         "use_rsi_filter": true,
         "rsi_period": 14,
         "rsi_upper": 65,
@@ -29,7 +29,7 @@
         "rsi_timeframe": "M1",
         "calibration": {
           "lookback_days": 5,
-          "percentile": 0.99
+          "percentile": 0.5
         }
       },
       "trade_limits": {
@@ -40,20 +40,6 @@
         "tp_volatility_multiplier": 0.5,
         "min_tp_points": 0.5,
         "max_tp_points": 5.0
-      }
-    },
-    "TREND_TEST_01": {
-      "enabled": true,
-      "script": "SignalEngines/Signal_TrendTest.py",
-      "magic_number": 55555,
-      "symbol": "US500",
-      "volume": 0.01,
-      "parameters": {
-        "dummy_param": 0
-      },
-      "trade_limits": {
-        "sl_points": 0,
-        "tp_points": 2.0
       }
     }
   }

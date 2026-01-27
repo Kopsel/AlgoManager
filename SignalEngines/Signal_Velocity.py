@@ -6,27 +6,31 @@ import pandas as pd
 import numpy as np
 import os
 import sys
+import traceback
 from datetime import datetime, timedelta
-
 
 # --- IDENTITY ---
 MY_STRATEGY_ID = "SPEED_US500_01"
 
-
 # --- PATH FIX ---
 script_dir = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(script_dir, "..", "system_config.json")
+# Try parent directory first (Standard), then current (Flat)
+config_path_1 = os.path.join(script_dir, "..", "system_config.json")
+config_path_2 = os.path.join(script_dir, "system_config.json")
 
+if os.path.exists(config_path_1):
+    CONFIG_FILE = config_path_1
+elif os.path.exists(config_path_2):
+    CONFIG_FILE = config_path_2
+else:
+    print(f"CRITICAL ERROR: Config file not found. Checked:\n1. {config_path_1}\n2. {config_path_2}")
+    time.sleep(10)
+    sys.exit(1)
 
 def load_config():
-    if not os.path.exists(CONFIG_FILE):
-        print(f"CRITICAL ERROR: Config file not found at: {CONFIG_FILE}")
-        input("Press Enter to exit...") 
-        sys.exit(1)
     with open(CONFIG_FILE, "r") as f:
         data = json.load(f)
         return data['strategies'][MY_STRATEGY_ID], data['system']
-
 
 # --- RSI INDICATOR FUNCTION ---
 def calculate_rsi(prices, period=14):
@@ -49,7 +53,6 @@ def calculate_rsi(prices, period=14):
     
     if rsi.empty: return 50.0
     return rsi.iloc[-1]
-
 
 def calculate_volatility_tp(df, limits):
     """Calculate dynamic TP based on recent volatility."""
@@ -78,19 +81,17 @@ def calculate_volatility_tp(df, limits):
     
     return float(max(min_tp, min(dynamic_tp, max_tp)))
 
-
 def calibrate_dynamic_threshold(symbol, time_window_sec, lookback_days, percentile):
     """
     Calibrate threshold based on historical tick data.
-    Calculates the percentile of price deltas over the specified time window.
     """
-    print(f"Calibrating dynamic threshold from {lookback_days} days of data...")
+    print(f"Calibrating dynamic threshold from {lookback_days} days of data...", flush=True)
     
     from_time = datetime.now() - timedelta(days=lookback_days)
     ticks = mt5.copy_ticks_from(symbol, from_time, 100000, mt5.COPY_TICKS_ALL)
     
     if ticks is None or len(ticks) < 1000:
-        print(f"⚠️  Calibration: Not enough data ({len(ticks) if ticks else 0} ticks), using fallback")
+        print(f"⚠️  Calibration: Not enough data ({len(ticks) if ticks else 0} ticks), using fallback", flush=True)
         return None
     
     df = pd.DataFrame(ticks)
@@ -107,23 +108,26 @@ def calibrate_dynamic_threshold(symbol, time_window_sec, lookback_days, percenti
             deltas.append(delta)
     
     if not deltas:
-        print(f"⚠️  Calibration: No deltas calculated, using fallback")
+        print(f"⚠️  Calibration: No deltas calculated, using fallback", flush=True)
         return None
     
     deltas_series = pd.Series(deltas)
     threshold = deltas_series.quantile(percentile)
     
-    print(f"✓ Dynamic threshold calibrated: {threshold:.6f} (percentile: {percentile * 100:.0f}%)")
-    print(f"  Data points: {len(deltas)} | Mean: {deltas_series.mean():.6f} | Std: {deltas_series.std():.6f}")
+    print(f"✓ Dynamic threshold calibrated: {threshold:.6f} (percentile: {percentile * 100:.0f}%)", flush=True)
     
     return float(threshold)
 
-
 def run_speed_engine():
     # --- 1. LOAD CONFIG ---
-    my_conf, sys_conf = load_config()
-    
-    # --- EXTRACT ALL CONFIG PARAMETERS PROPERLY ---
+    try:
+        my_conf, sys_conf = load_config()
+    except Exception as e:
+        print(f"❌ Error Loading Config: {e}", flush=True)
+        time.sleep(10)
+        return
+
+    # --- EXTRACT ALL CONFIG PARAMETERS ---
     SYMBOL = my_conf['symbol']
     VOLUME = my_conf['volume']
     MAGIC = my_conf['magic_number']
@@ -142,7 +146,7 @@ def run_speed_engine():
     RSI_LOWER = PARAMS.get('rsi_lower', 30)
     RSI_TIMEFRAME = PARAMS.get('rsi_timeframe', 'M1')
     
-    # Trade Limits (SL/TP points)
+    # Trade Limits
     TRADE_LIMITS = my_conf['trade_limits']
     SL_POINTS = TRADE_LIMITS.get('sl_points', 0)
     TP_POINTS = TRADE_LIMITS.get('tp_points', 1.0)
@@ -150,85 +154,64 @@ def run_speed_engine():
     
     # Timeframe Mapping
     TIMEFRAME_MAP = {
-        "M1": mt5.TIMEFRAME_M1,
-        "M2": mt5.TIMEFRAME_M2,
-        "M5": mt5.TIMEFRAME_M5,
-        "M15": mt5.TIMEFRAME_M15,
-        "M30": mt5.TIMEFRAME_M30,
-        "H1": mt5.TIMEFRAME_H1,
+        "M1": mt5.TIMEFRAME_M1, "M2": mt5.TIMEFRAME_M2, "M5": mt5.TIMEFRAME_M5,
+        "M15": mt5.TIMEFRAME_M15, "M30": mt5.TIMEFRAME_M30, "H1": mt5.TIMEFRAME_H1,
     }
     SELECTED_TF = TIMEFRAME_MAP.get(RSI_TIMEFRAME, mt5.TIMEFRAME_M1)
     
-    # --- 2. CALIBRATE DYNAMIC THRESHOLD IF ENABLED ---
+    # --- 2. CALIBRATE DYNAMIC THRESHOLD ---
     if USE_DYNAMIC_THRESHOLD:
         CALIBRATION = PARAMS.get('calibration', {})
         LOOKBACK_DAYS = CALIBRATION.get('lookback_days', 5)
         PERCENTILE = CALIBRATION.get('percentile', 0.5)
         
         calibrated = calibrate_dynamic_threshold(
-            SYMBOL, 
-            TIME_WINDOW_SEC,
-            LOOKBACK_DAYS,
-            PERCENTILE
+            SYMBOL, TIME_WINDOW_SEC, LOOKBACK_DAYS, PERCENTILE
         )
-        
         if calibrated is not None:
             FALLBACK_THRESHOLD = calibrated
         else:
-            print(f"⚠️  Falling back to static threshold: {FALLBACK_THRESHOLD:.6f}")
+            print(f"⚠️  Falling back to static threshold: {FALLBACK_THRESHOLD:.6f}", flush=True)
     
     # --- 3. CONNECT MT5 ---
     path = sys_conf.get('mt5_terminal_path')
     if path and os.path.exists(path):
         if not mt5.initialize(path=path):
-            print(f"❌ MT5 Init Failed at {path}")
-            print(f"   Error: {mt5.last_error()}")
+            print(f"❌ MT5 Init Failed at {path}", flush=True)
             sys.exit(1)
-        print(f"✓ MT5 initialized at: {path}")
     else:
         if not mt5.initialize():
-            print(f"❌ MT5 Init Failed (default path)")
-            print(f"   Error: {mt5.last_error()}")
+            print(f"❌ MT5 Init Failed (default path)", flush=True)
             sys.exit(1)
-        print(f"✓ MT5 initialized (default path)")
 
     if not mt5.symbol_select(SYMBOL, True):
-        print(f"❌ Failed to select symbol {SYMBOL}")
+        print(f"❌ Failed to select symbol {SYMBOL}", flush=True)
         sys.exit(1)
-    print(f"✓ Symbol selected: {SYMBOL}")
+    print(f"✓ Symbol selected: {SYMBOL}", flush=True)
 
-    # --- 4. CONNECT ZMQ ---
-    context = zmq.Context()
-    socket = context.socket(zmq.REQ)
+    # --- 4. CONNECT ZMQ (ROBUST / SELF-HEALING) ---
     zmq_host = sys_conf['zmq_host']
     zmq_port = sys_conf['zmq_port']
-    socket.connect(f"tcp://{zmq_host}:{zmq_port}")
-    print(f"✓ ZMQ connected to {zmq_host}:{zmq_port}")
+    context = zmq.Context()
+    
+    # Helper Function to Rebuild Connection cleanly
+    def connect_socket():
+        # print(f"Connecting to Trade Manager...", flush=True)
+        sock = context.socket(zmq.REQ)
+        sock.connect(f"tcp://{zmq_host}:{zmq_port}")
+        # IMPORTANT: Timeout ensures we don't freeze forever if Manager is busy
+        sock.setsockopt(zmq.RCVTIMEO, 2000) # 2 seconds timeout
+        sock.setsockopt(zmq.LINGER, 0)
+        return sock
+
+    socket = connect_socket()
+    print(f"✓ ZMQ connected to {zmq_host}:{zmq_port}", flush=True)
     
     # --- 5. PRINT CONFIGURATION SUMMARY ---
-    print("\n" + "="*70)
-    print(f"STRATEGY: {MY_STRATEGY_ID}")
-    print("="*70)
-    print(f"Symbol:              {SYMBOL}")
-    print(f"Volume:              {VOLUME}")
-    print(f"Magic Number:        {MAGIC}")
-    print(f"Time Window:         {TIME_WINDOW_SEC}s")
-    print(f"Cooldown:            {COOLDOWN_SEC}s")
-    print(f"Threshold:           {FALLBACK_THRESHOLD:.6f} {'(DYNAMIC)' if USE_DYNAMIC_THRESHOLD else '(STATIC)'}")
-    print(f"RSI Filter:          {'ON' if USE_RSI else 'OFF'}")
-    if USE_RSI:
-        print(f"  - Timeframe:       {RSI_TIMEFRAME}")
-        print(f"  - Period:          {RSI_PERIOD}")
-        print(f"  - Sell Threshold:  RSI > {RSI_UPPER}")
-        print(f"  - Buy Threshold:   RSI < {RSI_LOWER}")
-    print(f"SL Points:           {SL_POINTS}")
-    print(f"TP Points:           {TP_POINTS} {'(DYNAMIC)' if USE_VOL_TP else '(STATIC)'}")
-    if USE_VOL_TP:
-        print(f"  - Lookback:        {TRADE_LIMITS.get('volatility_lookback_sec', 60)}s")
-        print(f"  - Multiplier:      {TRADE_LIMITS.get('tp_volatility_multiplier', 0.5)}")
-        print(f"  - Min TP:          {TRADE_LIMITS.get('min_tp_points', 0.5)}")
-        print(f"  - Max TP:          {TRADE_LIMITS.get('max_tp_points', 5.0)}")
-    print("="*70 + "\n")
+    print("\n" + "="*70, flush=True)
+    print(f"STRATEGY: {MY_STRATEGY_ID}", flush=True)
+    print(f"Threshold: {FALLBACK_THRESHOLD:.6f} {'(DYNAMIC)' if USE_DYNAMIC_THRESHOLD else '(STATIC)'}", flush=True)
+    print("="*70 + "\n", flush=True)
 
     last_processed_tick_time = None
     last_rsi_check = 0
@@ -284,74 +267,70 @@ def run_speed_engine():
                         
                         # 2. APPLY EDGE FILTERS (RSI)
                         is_valid = True
-                        rejection_reason = ""
 
                         if USE_RSI:
-                            # SELL: Price going up, need RSI overbought
-                            if action == "SELL" and current_rsi < RSI_UPPER:
-                                is_valid = False
-                                rejection_reason = f"RSI too low ({current_rsi:.1f} < {RSI_UPPER})"
-
-                            # BUY: Price going down, need RSI oversold
-                            if action == "BUY" and current_rsi > RSI_LOWER:
-                                is_valid = False
-                                rejection_reason = f"RSI too high ({current_rsi:.1f} > {RSI_LOWER})"
+                            if action == "SELL" and current_rsi < RSI_UPPER: is_valid = False
+                            if action == "BUY" and current_rsi > RSI_LOWER: is_valid = False
 
                         # 3. EXECUTE OR REJECT
                         if is_valid:
                             # Calculate TP (static or dynamic)
-                            if USE_VOL_TP:
-                                calculated_tp = calculate_volatility_tp(df, TRADE_LIMITS)
-                            else:
-                                calculated_tp = TP_POINTS
+                            calculated_tp = calculate_volatility_tp(df, TRADE_LIMITS) if USE_VOL_TP else TP_POINTS
                             
                             signal_count += 1
                             timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
                             
-                            print(f"\n[{timestamp}] 🚀 SIGNAL #{signal_count} | {action:4s} | Speed: {delta:+.6f} | RSI: {current_rsi:5.1f} | TP: {calculated_tp:.2f} | SL: {SL_POINTS}")
+                            print(f"\n[{timestamp}] 🚀 SIGNAL #{signal_count} | {action:4s} | Speed: {delta:+.6f} | TP: {calculated_tp:.2f}", flush=True)
                             
-                            socket.send_json({
+                            payload = {
                                 "strategy_id": MY_STRATEGY_ID,
                                 "symbol": SYMBOL,
                                 "action": action,
                                 "dynamic_tp": calculated_tp,
                                 "extra_metrics": {
                                     "rsi": current_rsi if USE_RSI else 0,
-                                    "rsi_tf": RSI_TIMEFRAME,
                                     "speed": delta,
                                     "sl_points": SL_POINTS,
                                     "volume": VOLUME,
                                     "magic": MAGIC
                                 }
-                            })
+                            }
                             
+                            # --- ROBUST SENDING BLOCK (FIXED) ---
                             try:
-                                response = socket.recv_string(zmq.NOBLOCK)
-                                print(f"        Manager: {response}")
-                            except zmq.ZMQError:
-                                print(f"        ⚠️  Manager not responding (timeout)")
+                                # 1. Send Request
+                                socket.send_json(payload)
                                 
-                            print(f"        Cooling down for {COOLDOWN_SEC}s...")
+                                # 2. Receive Reply (BLOCKING with 2s Timeout)
+                                # IMPORTANT: We removed zmq.NOBLOCK. We MUST wait for reply or timeout.
+                                response = socket.recv_string()
+                                print(f"        Manager: {response}", flush=True)
+                                
+                            except zmq.Again:
+                                print(f"        ⚠️ Timeout: Manager busy. Resetting socket...", flush=True)
+                                socket.close()
+                                socket = connect_socket() # RECONNECT ON TIMEOUT
+                                
+                            except zmq.ZMQError as e:
+                                print(f"        ❌ ZMQ Error: {e}. Rebuilding connection...", flush=True)
+                                socket.close()
+                                socket = connect_socket() # RECONNECT ON CRASH
+                            
+                            print(f"        Cooling down for {COOLDOWN_SEC}s...", flush=True)
                             time.sleep(COOLDOWN_SEC)
-                        else:
-                            # Signal rejected (uncomment for debug)
-                            # print(f"\n❌ REJECTED: {rejection_reason}")
-                            pass
 
             time.sleep(0.01)
 
     except KeyboardInterrupt:
-        print("\n\n⏹️  Engine stopped by user")
+        print("\n\n⏹️  Engine stopped by user", flush=True)
     except Exception as e:
-        print(f"\n\n❌ Engine crashed: {e}")
-        import traceback
+        print(f"\n\n❌ Engine crashed: {e}", flush=True)
         traceback.print_exc()
     finally:
         mt5.shutdown()
         socket.close()
         context.term()
-        print("✓ Cleanup complete")
-
+        print("✓ Cleanup complete", flush=True)
 
 if __name__ == "__main__":
     run_speed_engine()

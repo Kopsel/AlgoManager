@@ -8,15 +8,12 @@ import os
 import sys
 from datetime import datetime, timedelta
 
-
 # --- IDENTITY ---
 MY_STRATEGY_ID = "SPEED_US500_01"
-
 
 # --- PATH FIX ---
 script_dir = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(script_dir, "..", "system_config.json")
-
 
 def load_config():
     if not os.path.exists(CONFIG_FILE):
@@ -26,7 +23,6 @@ def load_config():
     with open(CONFIG_FILE, "r") as f:
         data = json.load(f)
         return data['strategies'][MY_STRATEGY_ID], data['system']
-
 
 # --- RSI INDICATOR FUNCTION ---
 def calculate_rsi(prices, period=14):
@@ -49,7 +45,6 @@ def calculate_rsi(prices, period=14):
     
     if rsi.empty: return 50.0
     return rsi.iloc[-1]
-
 
 def calculate_volatility_tp(df, limits):
     """Calculate dynamic TP based on recent volatility."""
@@ -77,7 +72,6 @@ def calculate_volatility_tp(df, limits):
     max_tp = limits.get('max_tp_points', 5.0)
     
     return float(max(min_tp, min(dynamic_tp, max_tp)))
-
 
 def calibrate_dynamic_threshold(symbol, time_window_sec, lookback_days, percentile):
     """
@@ -117,7 +111,6 @@ def calibrate_dynamic_threshold(symbol, time_window_sec, lookback_days, percenti
     print(f"  Data points: {len(deltas)} | Mean: {deltas_series.mean():.6f} | Std: {deltas_series.std():.6f}")
     
     return float(threshold)
-
 
 def run_speed_engine():
     # --- 1. LOAD CONFIG ---
@@ -197,12 +190,22 @@ def run_speed_engine():
         sys.exit(1)
     print(f"✓ Symbol selected: {SYMBOL}")
 
-    # --- 4. CONNECT ZMQ ---
-    context = zmq.Context()
-    socket = context.socket(zmq.REQ)
+    # --- 4. CONNECT ZMQ (ROBUST / SELF-HEALING) ---
     zmq_host = sys_conf['zmq_host']
     zmq_port = sys_conf['zmq_port']
-    socket.connect(f"tcp://{zmq_host}:{zmq_port}")
+    context = zmq.Context()
+    
+    # Helper Function to Rebuild Connection cleanly
+    def connect_socket():
+        # print(f"Connecting to Trade Manager at {zmq_host}:{zmq_port}...")
+        sock = context.socket(zmq.REQ)
+        sock.connect(f"tcp://{zmq_host}:{zmq_port}")
+        # IMPORTANT: Timeout so we don't freeze forever if Manager is busy
+        sock.setsockopt(zmq.RCVTIMEO, 2000) # 2 seconds
+        sock.setsockopt(zmq.LINGER, 0)
+        return sock
+
+    socket = connect_socket()
     print(f"✓ ZMQ connected to {zmq_host}:{zmq_port}")
     
     # --- 5. PRINT CONFIGURATION SUMMARY ---
@@ -310,7 +313,7 @@ def run_speed_engine():
                             
                             print(f"\n[{timestamp}] 🚀 SIGNAL #{signal_count} | {action:4s} | Speed: {delta:+.6f} | RSI: {current_rsi:5.1f} | TP: {calculated_tp:.2f} | SL: {SL_POINTS}")
                             
-                            socket.send_json({
+                            payload = {
                                 "strategy_id": MY_STRATEGY_ID,
                                 "symbol": SYMBOL,
                                 "action": action,
@@ -323,14 +326,27 @@ def run_speed_engine():
                                     "volume": VOLUME,
                                     "magic": MAGIC
                                 }
-                            })
+                            }
                             
+                            # --- ROBUST SENDING BLOCK (FIXED CRASH HERE) ---
                             try:
-                                response = socket.recv_string(zmq.NOBLOCK)
-                                print(f"        Manager: {response}")
-                            except zmq.ZMQError:
-                                print(f"        ⚠️  Manager not responding (timeout)")
+                                # 1. Send Request
+                                socket.send_json(payload)
                                 
+                                # 2. Receive Reply (with 2s timeout from connect_socket settings)
+                                response = socket.recv_string()
+                                print(f"        Manager: {response}")
+                                
+                            except zmq.Again:
+                                print(f"        ⚠️ Timeout: Manager didn't reply. Resetting socket...")
+                                socket.close()
+                                socket = connect_socket() # RECONNECT ON TIMEOUT
+                                
+                            except zmq.ZMQError as e:
+                                print(f"        ❌ ZMQ Error: {e}. Rebuilding connection...")
+                                socket.close()
+                                socket = connect_socket() # RECONNECT ON CRASH
+                            
                             print(f"        Cooling down for {COOLDOWN_SEC}s...")
                             time.sleep(COOLDOWN_SEC)
                         else:
@@ -351,7 +367,6 @@ def run_speed_engine():
         socket.close()
         context.term()
         print("✓ Cleanup complete")
-
 
 if __name__ == "__main__":
     run_speed_engine()

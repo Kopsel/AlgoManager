@@ -29,9 +29,10 @@
         "rsi_timeframe": "M1",
         "rsi_latch_minutes": 60,
         "calibration": {
-          "lookback_days": 5,
+          "lookback_days": 10,
           "percentile": 0.6,
-          "recalibrate_minutes": 10
+          "recalibrate_minutes": 2,
+          "time_slice_minutes": 30
         }
       },
       "trade_limits": {

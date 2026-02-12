@@ -52,23 +52,46 @@ def calculate_volatility_tp(df, limits):
     low = recent_vol['ask'].min()
     return float(max(limits.get('min_tp_points', 0.5), min((high - low) * multiplier, limits.get('max_tp_points', 5.0))))
 
-def calibrate_dynamic_threshold(symbol, time_window_sec, lookback_days, percentile):
-    # This function is now silent to avoid spamming console every minute
-    # We print the status in the main loop instead
+# --- NEW: TIME-SPECIFIC CALIBRATION (Fully Configurable) ---
+def calibrate_time_specific_threshold(symbol, time_window_sec, lookback_days, percentile, time_slice_minutes):
+    # 1. Fetch data for the last X days
     from_time = datetime.now() - timedelta(days=lookback_days)
+    ticks = mt5.copy_ticks_from(symbol, from_time, 1000000, mt5.COPY_TICKS_ALL) 
     
-    # Fetch ticks (Heavy Operation)
-    ticks = mt5.copy_ticks_from(symbol, from_time, 100000, mt5.COPY_TICKS_ALL)
-    if ticks is None or len(ticks) < 1000: 
-        return None
+    if ticks is None or len(ticks) < 1000: return None
         
     df = pd.DataFrame(ticks)
     df['time'] = pd.to_datetime(df['time'], unit='s')
-    window_str = f"{time_window_sec}S"
-    df['window'] = df['time'].dt.floor(window_str)
+    
+    # 2. Add "Minute of Day" helper column
+    df['minute_of_day'] = df['time'].dt.hour * 60 + df['time'].dt.minute
+    
+    # 3. Determine the "Time Window" relevant to NOW
+    now = datetime.now()
+    current_minute_of_day = now.hour * 60 + now.minute
+    
+    # Use the variable from Config instead of hardcoded 30
+    min_bound = current_minute_of_day - time_slice_minutes
+    max_bound = current_minute_of_day + time_slice_minutes
+    
+    # Handle midnight wraparound
+    if min_bound < 0:
+        mask = (df['minute_of_day'] >= (1440 + min_bound)) | (df['minute_of_day'] <= max_bound)
+    elif max_bound > 1440:
+        mask = (df['minute_of_day'] >= min_bound) | (df['minute_of_day'] <= (max_bound - 1440))
+    else:
+        mask = (df['minute_of_day'] >= min_bound) & (df['minute_of_day'] <= max_bound)
+        
+    df_filtered = df.loc[mask].copy()
+    
+    if df_filtered.empty: return None
+        
+    # 4. Calculate Volatility on this TIME-SPECIFIC slice
+    window_str = f"{time_window_sec}s"
+    df_filtered['window'] = df_filtered['time'].dt.floor(window_str)
     
     deltas = []
-    for window, group in df.groupby('window'):
+    for window, group in df_filtered.groupby('window'):
         if len(group) > 1:
             delta = abs(group['ask'].iloc[-1] - group['ask'].iloc[0])
             deltas.append(delta)
@@ -77,6 +100,7 @@ def calibrate_dynamic_threshold(symbol, time_window_sec, lookback_days, percenti
     
     deltas_series = pd.Series(deltas)
     threshold = deltas_series.quantile(percentile)
+    
     return float(threshold)
 
 def run_speed_engine():
@@ -88,18 +112,18 @@ def run_speed_engine():
     MAGIC = my_conf['magic_number']
     PARAMS = my_conf['parameters']
     
-    # 1. Standard Params
+    # 1. Speed Params
     TIME_WINDOW_SEC = PARAMS['time_window_sec']
     COOLDOWN_SEC = PARAMS['cooldown_sec']
     FALLBACK_THRESHOLD = PARAMS['fallback_threshold']
     USE_DYNAMIC_THRESHOLD = PARAMS.get('use_dynamic_threshold', False)
     
-    # 2. Dynamic Calibration Params (New)
+    # 2. Calibration Params (ALL extracted from config)
     CALIB_CONF = PARAMS.get('calibration', {})
     CALIB_DAYS = CALIB_CONF.get('lookback_days', 5)
     CALIB_PERCENTILE = CALIB_CONF.get('percentile', 0.5)
-    # Default to 60 mins if missing, but your config has 1
-    CALIB_INTERVAL_MIN = CALIB_CONF.get('recalibrate_minutes', 60) 
+    CALIB_INTERVAL_MIN = CALIB_CONF.get('recalibrate_minutes', 10) 
+    CALIB_SLICE_MIN = CALIB_CONF.get('time_slice_minutes', 30) # Default 30 if missing
     
     # 3. RSI Params
     USE_RSI = PARAMS.get('use_rsi_filter', False)
@@ -122,8 +146,8 @@ def run_speed_engine():
 
     # --- INITIAL CALIBRATION ---
     if USE_DYNAMIC_THRESHOLD:
-        print(f"init Calibration (Days: {CALIB_DAYS})...", end="", flush=True)
-        calibrated = calibrate_dynamic_threshold(SYMBOL, TIME_WINDOW_SEC, CALIB_DAYS, CALIB_PERCENTILE)
+        print(f"init Time-Specific Calibration (Days: {CALIB_DAYS}, Slice: +/-{CALIB_SLICE_MIN}m)...", end="", flush=True)
+        calibrated = calibrate_time_specific_threshold(SYMBOL, TIME_WINDOW_SEC, CALIB_DAYS, CALIB_PERCENTILE, CALIB_SLICE_MIN)
         if calibrated: 
             FALLBACK_THRESHOLD = calibrated
             print(f" Done. Thr: {FALLBACK_THRESHOLD:.5f}")
@@ -146,7 +170,7 @@ def run_speed_engine():
     socket = connect_zmq()
     print(f"✓ ZMQ connected. Strategy: {MY_STRATEGY_ID}")
     print(f"✓ SPEED: M1 Ticks | RSI: {RSI_TF_STR} | Latch: {RSI_LOOKBACK_CANDLES} min")
-    print(f"✓ AUTO-CALIBRATE: Every {CALIB_INTERVAL_MIN} mins (Lookback: {CALIB_DAYS} days)", flush=True)
+    print(f"✓ SEASONAL CALIB: Comparing Current Time +/- {CALIB_SLICE_MIN}m vs Last {CALIB_DAYS} Days (Every {CALIB_INTERVAL_MIN} min)", flush=True)
 
     last_processed_tick_time = None
     last_rsi_check = 0
@@ -163,11 +187,10 @@ def run_speed_engine():
 
     try:
         while True:
-            # --- 0. AUTO-RECALIBRATE LOGIC ---
+            # --- 0. AUTO-RECALIBRATE (Time Specific) ---
             if USE_DYNAMIC_THRESHOLD and (time.time() - last_calibration_time > RECALIBRATE_INTERVAL_SEC):
-                # We print a small marker so you know why it pauses
-                print(f" [Calib]...", end='', flush=True) 
-                new_threshold = calibrate_dynamic_threshold(SYMBOL, TIME_WINDOW_SEC, CALIB_DAYS, CALIB_PERCENTILE)
+                print(f" [SeasonCalib]...", end='', flush=True) 
+                new_threshold = calibrate_time_specific_threshold(SYMBOL, TIME_WINDOW_SEC, CALIB_DAYS, CALIB_PERCENTILE, CALIB_SLICE_MIN)
                 if new_threshold:
                     FALLBACK_THRESHOLD = new_threshold
                 last_calibration_time = time.time()

@@ -24,13 +24,13 @@
         "fallback_threshold": 0.5,
         "use_rsi_filter": true,
         "rsi_period": 14,
-        "rsi_upper": 65,
-        "rsi_lower": 35,
+        "rsi_upper": 55,
+        "rsi_lower": 45,
         "rsi_timeframe": "M1",
-        "rsi_latch_minutes": 60,
+        "rsi_rolling_window_minutes": 60,
         "calibration": {
           "lookback_days": 10,
-          "percentile": 0.9,
+          "percentile": 0.95,
           "recalibrate_minutes": 2,
           "time_slice_minutes": 30
         }

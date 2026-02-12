@@ -55,7 +55,6 @@ def calculate_volatility_tp(df, limits):
 # --- TIME-SPECIFIC CALIBRATION ---
 def calibrate_time_specific_threshold(symbol, time_window_sec, lookback_days, percentile, time_slice_minutes):
     from_time = datetime.now() - timedelta(days=lookback_days)
-    # Fetch a large chunk to ensure we catch enough data
     ticks = mt5.copy_ticks_from(symbol, from_time, 1000000, mt5.COPY_TICKS_ALL) 
     
     if ticks is None or len(ticks) < 1000: return None
@@ -63,17 +62,15 @@ def calibrate_time_specific_threshold(symbol, time_window_sec, lookback_days, pe
     df = pd.DataFrame(ticks)
     df['time'] = pd.to_datetime(df['time'], unit='s')
     
-    # Add "Minute of Day"
+    # Minute of day
     df['minute_of_day'] = df['time'].dt.hour * 60 + df['time'].dt.minute
     
-    # Determine Time Window
     now = datetime.now()
     current_minute_of_day = now.hour * 60 + now.minute
-    
     min_bound = current_minute_of_day - time_slice_minutes
     max_bound = current_minute_of_day + time_slice_minutes
     
-    # Handle Midnight Wraparound
+    # Handle Midnight
     if min_bound < 0:
         mask = (df['minute_of_day'] >= (1440 + min_bound)) | (df['minute_of_day'] <= max_bound)
     elif max_bound > 1440:
@@ -82,10 +79,8 @@ def calibrate_time_specific_threshold(symbol, time_window_sec, lookback_days, pe
         mask = (df['minute_of_day'] >= min_bound) & (df['minute_of_day'] <= max_bound)
         
     df_filtered = df.loc[mask].copy()
-    
     if df_filtered.empty: return None
         
-    # Calculate Volatility
     window_str = f"{time_window_sec}s"
     df_filtered['window'] = df_filtered['time'].dt.floor(window_str)
     
@@ -94,12 +89,10 @@ def calibrate_time_specific_threshold(symbol, time_window_sec, lookback_days, pe
         if len(group) > 1:
             delta = abs(group['ask'].iloc[-1] - group['ask'].iloc[0])
             deltas.append(delta)
-            
     if not deltas: return None
     
     deltas_series = pd.Series(deltas)
     threshold = deltas_series.quantile(percentile)
-    
     return float(threshold)
 
 def run_speed_engine():
@@ -111,25 +104,26 @@ def run_speed_engine():
     MAGIC = my_conf['magic_number']
     PARAMS = my_conf['parameters']
     
-    # 1. Speed Params
     TIME_WINDOW_SEC = PARAMS['time_window_sec']
     COOLDOWN_SEC = PARAMS['cooldown_sec']
     FALLBACK_THRESHOLD = PARAMS['fallback_threshold']
     USE_DYNAMIC_THRESHOLD = PARAMS.get('use_dynamic_threshold', False)
     
-    # 2. Calibration Params
+    # Calibration
     CALIB_CONF = PARAMS.get('calibration', {})
     CALIB_DAYS = CALIB_CONF.get('lookback_days', 5)
     CALIB_PERCENTILE = CALIB_CONF.get('percentile', 0.5)
     CALIB_INTERVAL_MIN = CALIB_CONF.get('recalibrate_minutes', 10) 
     CALIB_SLICE_MIN = CALIB_CONF.get('time_slice_minutes', 30)
     
-    # 3. RSI Params
+    # RSI
     USE_RSI = PARAMS.get('use_rsi_filter', False)
     RSI_PERIOD = PARAMS.get('rsi_period', 14)
-    RSI_UPPER = PARAMS.get('rsi_upper', 70)
-    RSI_LOWER = PARAMS.get('rsi_lower', 30)
-    RSI_LOOKBACK_CANDLES = PARAMS.get('rsi_latch_minutes', 60)
+    RSI_UPPER = PARAMS.get('rsi_upper', 55) # Default 55 per request
+    RSI_LOWER = PARAMS.get('rsi_lower', 45) # Default 45 per request
+    
+    # Rolling Mean Window
+    RSI_MEAN_WINDOW = PARAMS.get('rsi_rolling_window_minutes', 60)
     
     RSI_TF_STR = PARAMS.get('rsi_timeframe', 'M1')
     TIMEFRAME_MAP = {
@@ -146,28 +140,21 @@ def run_speed_engine():
     if not mt5.initialize(): sys.exit(1)
     if not mt5.symbol_select(SYMBOL, True): sys.exit(1)
 
-    # --- ROBUST INITIAL CALIBRATION (Retry Loop) ---
+    # --- INITIAL CALIBRATION (Retry Loop) ---
     if USE_DYNAMIC_THRESHOLD:
         print(f"init Calibration (Days:{CALIB_DAYS}, Slice:+/-{CALIB_SLICE_MIN}m)...", end="", flush=True)
-        
         calib_success = False
-        max_retries = 10
-        
-        for attempt in range(max_retries):
+        for attempt in range(10):
             calibrated = calibrate_time_specific_threshold(SYMBOL, TIME_WINDOW_SEC, CALIB_DAYS, CALIB_PERCENTILE, CALIB_SLICE_MIN)
-            
             if calibrated: 
                 FALLBACK_THRESHOLD = calibrated
                 print(f" Done. Thr: {FALLBACK_THRESHOLD:.5f}")
                 calib_success = True
                 break
             else:
-                # If fail, print a dot and wait 3 seconds for MT5 to download data
                 print(".", end="", flush=True)
                 time.sleep(3)
-        
-        if not calib_success:
-            print(" Failed (Timeout). Using Fallback.")
+        if not calib_success: print(" Failed (Timeout). Using Fallback.")
 
     zmq_host, zmq_port = sys_conf['zmq_host'], sys_conf['zmq_port']
     context = zmq.Context()
@@ -181,24 +168,21 @@ def run_speed_engine():
 
     socket = connect_zmq()
     print(f"✓ ZMQ connected. Strategy: {MY_STRATEGY_ID}")
-    print(f"✓ SPEED: M1 Ticks | RSI: {RSI_TF_STR} | Latch: {RSI_LOOKBACK_CANDLES} min")
-    print(f"✓ SEASONAL CALIB: Comparing Current Time +/- {CALIB_SLICE_MIN}m vs Last {CALIB_DAYS} Days (Every {CALIB_INTERVAL_MIN} min)", flush=True)
+    print(f"✓ SPEED: M1 Ticks | RSI REGIME: Rolling Mean of last {RSI_MEAN_WINDOW} mins")
 
     last_processed_tick_time = None
     last_rsi_check = 0
-    
     last_calibration_time = time.time()
     RECALIBRATE_INTERVAL_SEC = CALIB_INTERVAL_MIN * 60
 
-    recent_max_rsi = 50.0 
-    recent_min_rsi = 50.0
     current_rsi = 50.0
+    mean_rsi = 50.0 # Rolling Average
     
     signal_count = 0
 
     try:
         while True:
-            # --- 0. AUTO-RECALIBRATE (Time Specific) ---
+            # 0. Calibrate
             if USE_DYNAMIC_THRESHOLD and (time.time() - last_calibration_time > RECALIBRATE_INTERVAL_SEC):
                 print(f" [SeasonCalib]...", end='', flush=True) 
                 new_threshold = calibrate_time_specific_threshold(SYMBOL, TIME_WINDOW_SEC, CALIB_DAYS, CALIB_PERCENTILE, CALIB_SLICE_MIN)
@@ -206,7 +190,7 @@ def run_speed_engine():
                     FALLBACK_THRESHOLD = new_threshold
                 last_calibration_time = time.time()
 
-            # --- 1. Get Ticks ---
+            # 1. Ticks
             from_time = datetime.now() - timedelta(minutes=5)
             ticks = mt5.copy_ticks_from(SYMBOL, from_time, 2000, mt5.COPY_TICKS_ALL)
             
@@ -214,17 +198,20 @@ def run_speed_engine():
                 df = pd.DataFrame(ticks)
                 df['time'] = pd.to_datetime(df['time'], unit='s')
                 
-                # --- 2. RSI Update ---
+                # 2. RSI Update (ROLLING MEAN)
                 if USE_RSI and (time.time() - last_rsi_check > 2):
-                    fetch_count = max(100, RSI_LOOKBACK_CANDLES + 10)
+                    fetch_count = max(100, RSI_MEAN_WINDOW + 20)
                     rates = mt5.copy_rates_from_pos(SYMBOL, SELECTED_TF, 0, fetch_count)
                     
                     if rates is not None and len(rates) > RSI_PERIOD:
                         df_rates = pd.DataFrame(rates)
                         rsi_series = calculate_rsi_series(df_rates['close'], RSI_PERIOD)
+                        
                         current_rsi = rsi_series.iloc[-1]
-                        recent_max_rsi = rsi_series.iloc[-RSI_LOOKBACK_CANDLES:].max()
-                        recent_min_rsi = rsi_series.iloc[-RSI_LOOKBACK_CANDLES:].min()
+                        
+                        # CALCULATE ROLLING MEAN
+                        subset = rsi_series.iloc[-RSI_MEAN_WINDOW:]
+                        mean_rsi = subset.mean()
                         
                     last_rsi_check = time.time()
 
@@ -241,9 +228,14 @@ def run_speed_engine():
                     delta = recent.iloc[-1]['ask'] - recent.iloc[0]['ask']
                     
                     if USE_RSI:
-                        can_sell = "✅" if recent_max_rsi > RSI_UPPER else "❌"
-                        can_buy  = "✅" if recent_min_rsi < RSI_LOWER else "❌"
-                        rsi_txt = f"Curr:{current_rsi:.1f} | Max:{recent_max_rsi:.1f}({can_sell}) | Min:{recent_min_rsi:.1f}({can_buy})"
+                        # Direct Config Usage
+                        bias = "NEUTRAL (Block)"
+                        
+                        if mean_rsi > RSI_UPPER: bias = "HOT (Allow Sell)"
+                        elif mean_rsi < RSI_LOWER: bias = "COLD (Allow Buy)"
+                        
+                        # LOGGING: Added Avg(...) output
+                        rsi_txt = f"Curr:{current_rsi:.1f} | Avg({RSI_MEAN_WINDOW}m):{mean_rsi:.1f} [{bias}]"
                     else:
                         rsi_txt = "OFF"
                         
@@ -251,11 +243,22 @@ def run_speed_engine():
 
                     if abs(delta) > FALLBACK_THRESHOLD:
                         action = "SELL" if delta > 0 else "BUY"
-                        is_valid = True
+                        is_valid = False 
                         
                         if USE_RSI:
-                            if action == "SELL" and recent_max_rsi < RSI_UPPER: is_valid = False
-                            if action == "BUY" and recent_min_rsi > RSI_LOWER: is_valid = False
+                            # LOGIC: Fade the Regime using Exact Config Values
+                            
+                            # 1. Hot Regime (> 55) -> ALLOW SELLS
+                            if action == "SELL" and mean_rsi > RSI_UPPER:
+                                is_valid = True
+                            
+                            # 2. Cold Regime (< 45) -> ALLOW BUYS
+                            elif action == "BUY" and mean_rsi < RSI_LOWER:
+                                is_valid = True
+                                
+                            # 3. Neutral (45-55) -> BLOCK ALL
+                        else:
+                            is_valid = True
 
                         if is_valid:
                             tp = calculate_volatility_tp(df, TRADE_LIMITS) if USE_VOL_TP else TP_POINTS

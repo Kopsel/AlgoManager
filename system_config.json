@@ -30,7 +30,7 @@
         "rsi_latch_minutes": 60,
         "calibration": {
           "lookback_days": 10,
-          "percentile": 0.6,
+          "percentile": 0.9,
           "recalibrate_minutes": 2,
           "time_slice_minutes": 30
         }

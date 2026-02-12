@@ -52,10 +52,10 @@ def calculate_volatility_tp(df, limits):
     low = recent_vol['ask'].min()
     return float(max(limits.get('min_tp_points', 0.5), min((high - low) * multiplier, limits.get('max_tp_points', 5.0))))
 
-# --- NEW: TIME-SPECIFIC CALIBRATION (Fully Configurable) ---
+# --- TIME-SPECIFIC CALIBRATION ---
 def calibrate_time_specific_threshold(symbol, time_window_sec, lookback_days, percentile, time_slice_minutes):
-    # 1. Fetch data for the last X days
     from_time = datetime.now() - timedelta(days=lookback_days)
+    # Fetch a large chunk to ensure we catch enough data
     ticks = mt5.copy_ticks_from(symbol, from_time, 1000000, mt5.COPY_TICKS_ALL) 
     
     if ticks is None or len(ticks) < 1000: return None
@@ -63,18 +63,17 @@ def calibrate_time_specific_threshold(symbol, time_window_sec, lookback_days, pe
     df = pd.DataFrame(ticks)
     df['time'] = pd.to_datetime(df['time'], unit='s')
     
-    # 2. Add "Minute of Day" helper column
+    # Add "Minute of Day"
     df['minute_of_day'] = df['time'].dt.hour * 60 + df['time'].dt.minute
     
-    # 3. Determine the "Time Window" relevant to NOW
+    # Determine Time Window
     now = datetime.now()
     current_minute_of_day = now.hour * 60 + now.minute
     
-    # Use the variable from Config instead of hardcoded 30
     min_bound = current_minute_of_day - time_slice_minutes
     max_bound = current_minute_of_day + time_slice_minutes
     
-    # Handle midnight wraparound
+    # Handle Midnight Wraparound
     if min_bound < 0:
         mask = (df['minute_of_day'] >= (1440 + min_bound)) | (df['minute_of_day'] <= max_bound)
     elif max_bound > 1440:
@@ -86,7 +85,7 @@ def calibrate_time_specific_threshold(symbol, time_window_sec, lookback_days, pe
     
     if df_filtered.empty: return None
         
-    # 4. Calculate Volatility on this TIME-SPECIFIC slice
+    # Calculate Volatility
     window_str = f"{time_window_sec}s"
     df_filtered['window'] = df_filtered['time'].dt.floor(window_str)
     
@@ -118,12 +117,12 @@ def run_speed_engine():
     FALLBACK_THRESHOLD = PARAMS['fallback_threshold']
     USE_DYNAMIC_THRESHOLD = PARAMS.get('use_dynamic_threshold', False)
     
-    # 2. Calibration Params (ALL extracted from config)
+    # 2. Calibration Params
     CALIB_CONF = PARAMS.get('calibration', {})
     CALIB_DAYS = CALIB_CONF.get('lookback_days', 5)
     CALIB_PERCENTILE = CALIB_CONF.get('percentile', 0.5)
     CALIB_INTERVAL_MIN = CALIB_CONF.get('recalibrate_minutes', 10) 
-    CALIB_SLICE_MIN = CALIB_CONF.get('time_slice_minutes', 30) # Default 30 if missing
+    CALIB_SLICE_MIN = CALIB_CONF.get('time_slice_minutes', 30)
     
     # 3. RSI Params
     USE_RSI = PARAMS.get('use_rsi_filter', False)
@@ -144,18 +143,31 @@ def run_speed_engine():
     TP_POINTS = TRADE_LIMITS.get('tp_points', 1.0)
     USE_VOL_TP = TRADE_LIMITS.get('use_volatility_based_tp', False)
 
-    # --- INITIAL CALIBRATION ---
-    if USE_DYNAMIC_THRESHOLD:
-        print(f"init Time-Specific Calibration (Days: {CALIB_DAYS}, Slice: +/-{CALIB_SLICE_MIN}m)...", end="", flush=True)
-        calibrated = calibrate_time_specific_threshold(SYMBOL, TIME_WINDOW_SEC, CALIB_DAYS, CALIB_PERCENTILE, CALIB_SLICE_MIN)
-        if calibrated: 
-            FALLBACK_THRESHOLD = calibrated
-            print(f" Done. Thr: {FALLBACK_THRESHOLD:.5f}")
-        else:
-            print(" Failed. Using Fallback.")
-
     if not mt5.initialize(): sys.exit(1)
     if not mt5.symbol_select(SYMBOL, True): sys.exit(1)
+
+    # --- ROBUST INITIAL CALIBRATION (Retry Loop) ---
+    if USE_DYNAMIC_THRESHOLD:
+        print(f"init Calibration (Days:{CALIB_DAYS}, Slice:+/-{CALIB_SLICE_MIN}m)...", end="", flush=True)
+        
+        calib_success = False
+        max_retries = 10
+        
+        for attempt in range(max_retries):
+            calibrated = calibrate_time_specific_threshold(SYMBOL, TIME_WINDOW_SEC, CALIB_DAYS, CALIB_PERCENTILE, CALIB_SLICE_MIN)
+            
+            if calibrated: 
+                FALLBACK_THRESHOLD = calibrated
+                print(f" Done. Thr: {FALLBACK_THRESHOLD:.5f}")
+                calib_success = True
+                break
+            else:
+                # If fail, print a dot and wait 3 seconds for MT5 to download data
+                print(".", end="", flush=True)
+                time.sleep(3)
+        
+        if not calib_success:
+            print(" Failed (Timeout). Using Fallback.")
 
     zmq_host, zmq_port = sys_conf['zmq_host'], sys_conf['zmq_port']
     context = zmq.Context()
@@ -175,7 +187,6 @@ def run_speed_engine():
     last_processed_tick_time = None
     last_rsi_check = 0
     
-    # Recalibration Timer
     last_calibration_time = time.time()
     RECALIBRATE_INTERVAL_SEC = CALIB_INTERVAL_MIN * 60
 

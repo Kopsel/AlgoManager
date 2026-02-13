@@ -33,6 +33,21 @@
           "percentile": 0.95,
           "recalibrate_minutes": 2,
           "time_slice_minutes": 30
+        },
+        "dynamic_sizing": {
+          "enabled": true,
+          "lookback_minutes": 60,
+          "base_volume": 0.05,
+          "grind_zone": {
+            "skew_threshold": 5,
+            "with_trend_volume": 0.08,
+            "fade_trend_volume": 0.02
+          },
+          "runaway_zone": {
+            "skew_threshold": 10,
+            "with_trend_volume": 0.12,
+            "fade_trend_volume": 0.00
+          }
         }
       },
       "trade_limits": {

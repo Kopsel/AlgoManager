@@ -39,63 +39,66 @@ def calculate_rsi_series(prices, period=14):
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
-# --- UPDATED: HFT TP CALCULATION (Using raw NumPy array) ---
 def calculate_volatility_tp(ticks_array, limits):
     if not limits.get('use_volatility_based_tp', False): return limits.get('tp_points', 1.0)
-    
-    # Use exact milliseconds
     lookback_ms = limits.get('volatility_lookback_sec', 60) * 1000
     current_msc = ticks_array[-1]['time_msc']
     cutoff_msc = current_msc - lookback_ms
-    
-    # Fast NumPy filtering
     recent_vol = ticks_array[ticks_array['time_msc'] >= cutoff_msc]
     if len(recent_vol) == 0: return limits.get('tp_points', 1.0)
-    
     high = np.max(recent_vol['ask'])
     low = np.min(recent_vol['ask'])
     multiplier = limits.get('tp_volatility_multiplier', 0.5)
-    
     return float(max(limits.get('min_tp_points', 0.5), min((high - low) * multiplier, limits.get('max_tp_points', 5.0))))
 
-# --- SNIPER CALIBRATION ---
 def calibrate_time_specific_threshold(symbol, time_window_sec, lookback_days, percentile, time_slice_minutes):
     now = datetime.now()
     deltas = []
-    
     for i in range(lookback_days):
         target_time = now - timedelta(days=i)
-        
         slice_start = target_time - timedelta(minutes=time_slice_minutes)
         slice_end = target_time + timedelta(minutes=time_slice_minutes)
-        
         ticks = mt5.copy_ticks_range(symbol, slice_start, slice_end, mt5.COPY_TICKS_ALL)
-        
         if ticks is not None and len(ticks) > 10:
             df = pd.DataFrame(ticks)
             df['time'] = pd.to_datetime(df['time'], unit='s')
-            
             window_str = f"{time_window_sec}s"
             df['window'] = df['time'].dt.floor(window_str)
-            
             for window, group in df.groupby('window'):
                 if len(group) > 1:
                     delta = abs(group['ask'].iloc[-1] - group['ask'].iloc[0])
                     deltas.append(delta)
-                    
-    if not deltas: 
-        return None
-    
+    if not deltas: return None
     deltas_series = pd.Series(deltas)
-    threshold = deltas_series.quantile(percentile)
-    return float(threshold)
+    return float(deltas_series.quantile(percentile))
+
+# --- NEW: INVENTORY SKEW LOGIC ---
+def get_inventory_skew(symbol, magic, lookback_minutes):
+    positions = mt5.positions_get(symbol=symbol)
+    if positions is None or len(positions) == 0:
+        return 0, 0, 0
+        
+    cutoff_timestamp = (datetime.now() - timedelta(minutes=lookback_minutes)).timestamp()
+    
+    recent_longs = 0
+    recent_shorts = 0
+    
+    for pos in positions:
+        if pos.magic == magic and pos.time >= cutoff_timestamp:
+            if pos.type == mt5.ORDER_TYPE_BUY:
+                recent_longs += 1
+            elif pos.type == mt5.ORDER_TYPE_SELL:
+                recent_shorts += 1
+                
+    # Skew: Positive = Net Long, Negative = Net Short
+    skew = recent_longs - recent_shorts
+    return skew, recent_longs, recent_shorts
 
 def run_speed_engine():
     try: my_conf, sys_conf = load_config()
     except: return
 
     SYMBOL = my_conf['symbol']
-    VOLUME = my_conf['volume']
     MAGIC = my_conf['magic_number']
     PARAMS = my_conf['parameters']
     
@@ -104,29 +107,39 @@ def run_speed_engine():
     FALLBACK_THRESHOLD = PARAMS['fallback_threshold']
     USE_DYNAMIC_THRESHOLD = PARAMS.get('use_dynamic_threshold', False)
     
+    # Calibration
     CALIB_CONF = PARAMS.get('calibration', {})
     CALIB_DAYS = CALIB_CONF.get('lookback_days', 10)
     CALIB_PERCENTILE = CALIB_CONF.get('percentile', 0.95)
     CALIB_INTERVAL_MIN = CALIB_CONF.get('recalibrate_minutes', 2) 
     CALIB_SLICE_MIN = CALIB_CONF.get('time_slice_minutes', 30)
     
+    # RSI
     USE_RSI = PARAMS.get('use_rsi_filter', False)
     RSI_PERIOD = PARAMS.get('rsi_period', 14)
     RSI_UPPER = PARAMS.get('rsi_upper', 65) 
     RSI_LOWER = PARAMS.get('rsi_lower', 35) 
     RSI_ANCHOR_MINUTES = PARAMS.get('rsi_rolling_window_minutes', 60)
+    SELECTED_TF = mt5.TIMEFRAME_M1
     
-    RSI_TF_STR = PARAMS.get('rsi_timeframe', 'M1')
-    TIMEFRAME_MAP = {
-        "M1": mt5.TIMEFRAME_M1, "M2": mt5.TIMEFRAME_M2, "M5": mt5.TIMEFRAME_M5,
-        "M15": mt5.TIMEFRAME_M15, "M30": mt5.TIMEFRAME_M30, "H1": mt5.TIMEFRAME_H1
-    }
-    SELECTED_TF = TIMEFRAME_MAP.get(RSI_TF_STR, mt5.TIMEFRAME_M1)
+    # Dynamic Sizing
+    DYN_CONF = PARAMS.get('dynamic_sizing', {})
+    USE_DYN_SIZE = DYN_CONF.get('enabled', False)
+    SKEW_LOOKBACK = DYN_CONF.get('lookback_minutes', 60)
+    BASE_VOL = DYN_CONF.get('base_volume', my_conf['volume'])
+    
+    # Gear Configurations
+    GRIND_THR = DYN_CONF.get('grind_zone', {}).get('skew_threshold', 5)
+    GRIND_WITH_TREND = DYN_CONF.get('grind_zone', {}).get('with_trend_volume', 0.08)
+    GRIND_FADE_TREND = DYN_CONF.get('grind_zone', {}).get('fade_trend_volume', 0.02)
+    
+    RUNAWAY_THR = DYN_CONF.get('runaway_zone', {}).get('skew_threshold', 10)
+    RUNAWAY_WITH_TREND = DYN_CONF.get('runaway_zone', {}).get('with_trend_volume', 0.12)
+    RUNAWAY_FADE_TREND = DYN_CONF.get('runaway_zone', {}).get('fade_trend_volume', 0.0)
 
     TRADE_LIMITS = my_conf['trade_limits']
-    SL_POINTS = TRADE_LIMITS.get('sl_points', 0)
-    TP_POINTS = TRADE_LIMITS.get('tp_points', 1.0)
     USE_VOL_TP = TRADE_LIMITS.get('use_volatility_based_tp', False)
+    TP_POINTS = TRADE_LIMITS.get('tp_points', 1.0)
 
     if not mt5.initialize(): sys.exit(1)
     if not mt5.symbol_select(SYMBOL, True): sys.exit(1)
@@ -158,33 +171,31 @@ def run_speed_engine():
 
     socket = connect_zmq()
     print(f"✓ ZMQ connected. Strategy: {MY_STRATEGY_ID}")
-    print(f"✓ SPEED: M1 Ticks (HFT Millisecond Core) | EDGE: Anchor Point (RSI @ -{RSI_ANCHOR_MINUTES}m)")
+    print(f"✓ SPEED: HFT Millisecond Core | DYNAMIC SIZING: {'ON' if USE_DYN_SIZE else 'OFF'}")
 
     last_processed_tick_msc = 0
-    last_rsi_check = 0
+    last_slow_check = 0
     last_calibration_time = time.time()
     RECALIBRATE_INTERVAL_SEC = CALIB_INTERVAL_MIN * 60
 
     current_rsi = 50.0
     anchor_rsi = 50.0 
+    skew = 0
+    recent_longs = 0
+    recent_shorts = 0
+    buy_vol = BASE_VOL
+    sell_vol = BASE_VOL
+    skew_state = "CHOP"
     
     signal_count = 0
 
     try:
         while True:
-            # 0. Calibrate (Runs in background)
             if USE_DYNAMIC_THRESHOLD and (time.time() - last_calibration_time > RECALIBRATE_INTERVAL_SEC):
-                print(f"\n[SeasonCalib] Recalibrating...", end='', flush=True) 
                 new_threshold = calibrate_time_specific_threshold(SYMBOL, TIME_WINDOW_SEC, CALIB_DAYS, CALIB_PERCENTILE, CALIB_SLICE_MIN)
-                if new_threshold:
-                    FALLBACK_THRESHOLD = new_threshold
-                    print(f" Success: {FALLBACK_THRESHOLD:.3f}", flush=True)
-                else:
-                    print(f" Failed: Kept {FALLBACK_THRESHOLD:.3f}", flush=True)
+                if new_threshold: FALLBACK_THRESHOLD = new_threshold
                 last_calibration_time = time.time()
 
-            # 1. HFT Tick Fetching (Raw Array via Exact Time Range)
-            # Fetch exactly the last 90 seconds to cover the 60s TP lookback and 2s Speed window
             from_time = datetime.now() - timedelta(seconds=90)
             ticks = mt5.copy_ticks_range(SYMBOL, from_time, datetime.now(), mt5.COPY_TICKS_ALL)
             
@@ -192,66 +203,122 @@ def run_speed_engine():
                 current_tick = ticks[-1]
                 current_msc = current_tick['time_msc']
                 
-                # Prevent processing the exact same micro-tick twice
                 if last_processed_tick_msc == current_msc:
-                    time.sleep(0.005) # Tiny sleep to avoid redlining the CPU
+                    time.sleep(0.005) 
                     continue
                 last_processed_tick_msc = current_msc
                 
-                # 2. RSI Update (Runs every 2 seconds to save CPU)
-                if USE_RSI and (time.time() - last_rsi_check > 2):
-                    fetch_count = max(100, RSI_ANCHOR_MINUTES + 10)
-                    rates = mt5.copy_rates_from_pos(SYMBOL, SELECTED_TF, 0, fetch_count)
+                # --- SLOW CHECKS (RSI & INVENTORY SKEW) - Runs every 2 seconds ---
+                if time.time() - last_slow_check > 2:
                     
-                    if rates is not None and len(rates) > RSI_PERIOD:
-                        df_rates = pd.DataFrame(rates)
-                        rsi_series = calculate_rsi_series(df_rates['close'], RSI_PERIOD)
+                    # RSI Logic
+                    if USE_RSI:
+                        fetch_count = max(100, RSI_ANCHOR_MINUTES + 10)
+                        rates = mt5.copy_rates_from_pos(SYMBOL, SELECTED_TF, 0, fetch_count)
+                        if rates is not None and len(rates) > RSI_PERIOD:
+                            df_rates = pd.DataFrame(rates)
+                            rsi_series = calculate_rsi_series(df_rates['close'], RSI_PERIOD)
+                            current_rsi = rsi_series.iloc[-1]
+                            anchor_rsi = rsi_series.iloc[-min(len(rsi_series)-1, RSI_ANCHOR_MINUTES)]
+                    
+                    # Inventory Skew Sizing Logic
+                    if USE_DYN_SIZE:
+                        skew, recent_longs, recent_shorts = get_inventory_skew(SYMBOL, MAGIC, SKEW_LOOKBACK)
                         
-                        current_rsi = rsi_series.iloc[-1]
-                        lookback_idx = min(len(rsi_series)-1, RSI_ANCHOR_MINUTES)
-                        anchor_rsi = rsi_series.iloc[-lookback_idx]
+                        # Reset Defaults
+                        buy_vol = BASE_VOL
+                        sell_vol = BASE_VOL
+                        skew_state = "CHOP (Balanced)"
                         
-                    last_rsi_check = time.time()
+                        # 1. Negative Skew = Net Shorts stuck -> Market Grinding UP 📈
+                        if skew <= -RUNAWAY_THR:
+                            skew_state = "RUNAWAY UP"
+                            buy_vol = RUNAWAY_WITH_TREND
+                            sell_vol = RUNAWAY_FADE_TREND
+                        elif skew <= -GRIND_THR:
+                            skew_state = "GRIND UP"
+                            buy_vol = GRIND_WITH_TREND
+                            sell_vol = GRIND_FADE_TREND
+                            
+                        # 2. Positive Skew = Net Longs stuck -> Market Grinding DOWN 📉
+                        elif skew >= RUNAWAY_THR:
+                            skew_state = "RUNAWAY DOWN"
+                            buy_vol = RUNAWAY_FADE_TREND
+                            sell_vol = RUNAWAY_WITH_TREND
+                        elif skew >= GRIND_THR:
+                            skew_state = "GRIND DOWN"
+                            buy_vol = GRIND_FADE_TREND
+                            sell_vol = GRIND_WITH_TREND
 
-                # 3. MILLISECOND VELOCITY CALCULATION
+                    last_slow_check = time.time()
+
+                # --- FAST CHECKS (SPEED CALCULATION) ---
                 cutoff_msc = current_msc - (TIME_WINDOW_SEC * 1000)
-                
-                # Extremely fast NumPy boolean indexing
                 valid_ticks = ticks[ticks['time_msc'] >= cutoff_msc]
                 
                 if len(valid_ticks) > 1:
-                    delta = valid_ticks[-1]['ask'] - valid_ticks[0]['ask']
+                    tick_start = valid_ticks[0]
+                    tick_end = valid_ticks[-1]
+                    delta = tick_end['ask'] - tick_start['ask']
                     
                     if USE_RSI:
                         bias = "NEUTRAL (Block)"
                         if anchor_rsi > RSI_UPPER: bias = "HOT (Allow Sell)"
                         elif anchor_rsi < RSI_LOWER: bias = "COLD (Allow Buy)"
-                        
                         rsi_txt = f"Curr:{current_rsi:.1f} | Past(-{RSI_ANCHOR_MINUTES}m):{anchor_rsi:.1f} [{bias}]"
                     else:
                         rsi_txt = "OFF"
                         
-                    print(f"Thr:{FALLBACK_THRESHOLD:.3f} | Speed:{delta:+.3f} | {rsi_txt}      ", end='\r', flush=True)
+                    skew_txt = f"Skew:{skew:+d} (L:{recent_longs} S:{recent_shorts}) [{skew_state}]" if USE_DYN_SIZE else "Size: STATIC"
+                    print(f"Thr:{FALLBACK_THRESHOLD:.3f} | Speed:{delta:+.3f} | {rsi_txt} | {skew_txt}       ", end='\r', flush=True)
 
                     if abs(delta) > FALLBACK_THRESHOLD:
                         action = "SELL" if delta > 0 else "BUY"
-                        is_valid = False 
+                        is_valid = True 
                         
                         if USE_RSI:
-                            if action == "SELL" and anchor_rsi > RSI_UPPER: is_valid = True
-                            elif action == "BUY" and anchor_rsi < RSI_LOWER: is_valid = True
-                        else:
-                            is_valid = True
+                            if action == "SELL" and anchor_rsi <= RSI_UPPER: is_valid = False
+                            elif action == "BUY" and anchor_rsi >= RSI_LOWER: is_valid = False
+
+                        # Apply Dynamic Volume
+                        target_vol = buy_vol if action == "BUY" else sell_vol
+                        
+                        # Block trades if sizing logic sets volume to 0 (Runaway filter)
+                        if target_vol <= 0.0:
+                            is_valid = False
+                            ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                            print(f"\n[{ts}] 🛑 SIGNAL BLOCKED: {action} blocked by {skew_state} protective filter.", flush=True)
 
                         if is_valid:
                             tp = calculate_volatility_tp(ticks, TRADE_LIMITS) if USE_VOL_TP else TP_POINTS
                             signal_count += 1
-                            ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                            print(f"\n[{ts}] 🚀 SIGNAL #{signal_count} | {action} | Speed: {delta:+.6f} | TP: {tp:.2f}", flush=True)
                             
+                            t_start_str = pd.to_datetime(tick_start['time_msc'], unit='ms').strftime('%H:%M:%S.%f')[:-3]
+                            t_end_str = pd.to_datetime(tick_end['time_msc'], unit='ms').strftime('%H:%M:%S.%f')[:-3]
+                            
+                            # --- THE AUDIT RECEIPT ---
+                            print("\n\n" + "="*55)
+                            print("🚨 SIGNAL AUDIT RECEIPT 🚨")
+                            print(f"Action:      {action} (Signal #{signal_count})")
+                            print(f"Time Window: {TIME_WINDOW_SEC} Seconds")
+                            print(f"Start Price: {tick_start['ask']:.3f} (at {t_start_str})")
+                            print(f"End Price:   {tick_end['ask']:.3f} (at {t_end_str})")
+                            print(f"Math:        {tick_end['ask']:.3f} - {tick_start['ask']:.3f} = {delta:+.3f}")
+                            print(f"Threshold:   {FALLBACK_THRESHOLD:.3f} (Valid: {abs(delta):.3f} > {FALLBACK_THRESHOLD:.3f})")
+                            if USE_RSI:
+                                print(f"Anchor RSI:  {anchor_rsi:.1f} (Allowed: {'<' if action=='BUY' else '>'} {RSI_LOWER if action=='BUY' else RSI_UPPER})")
+                            if USE_DYN_SIZE:
+                                print(f"Skew State:  {skew_state}")
+                                print(f"Recent Skew: {skew:+d} (Stranded L: {recent_longs} | S: {recent_shorts})")
+                            print(f"Volume:      {target_vol:.2f} lots")
+                            print(f"Dynamic TP:  {tp:.2f} points")
+                            print("="*55 + "\n", flush=True)
+                            
+                            # Send dynamic volume to Trade Manager
                             payload = {
-                                "strategy_id": MY_STRATEGY_ID, "symbol": SYMBOL, "action": action, "dynamic_tp": tp,
-                                "extra_metrics": {"rsi": current_rsi, "speed": delta, "magic": MAGIC}
+                                "strategy_id": MY_STRATEGY_ID, "symbol": SYMBOL, "action": action, 
+                                "dynamic_tp": tp, "volume": target_vol,
+                                "extra_metrics": {"rsi": current_rsi, "speed": delta, "magic": MAGIC, "skew": skew}
                             }
                             
                             try:

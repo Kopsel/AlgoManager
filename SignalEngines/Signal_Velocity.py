@@ -29,7 +29,6 @@ def load_config():
         data = json.load(f)
         return data['strategies'][MY_STRATEGY_ID], data['system']
 
-# --- RSI SERIES FUNCTION ---
 def calculate_rsi_series(prices, period=14):
     delta = prices.diff()
     gain = (delta.where(delta > 0, 0)).fillna(0)
@@ -52,43 +51,35 @@ def calculate_volatility_tp(df, limits):
     low = recent_vol['ask'].min()
     return float(max(limits.get('min_tp_points', 0.5), min((high - low) * multiplier, limits.get('max_tp_points', 5.0))))
 
-# --- TIME-SPECIFIC CALIBRATION ---
+# --- NEW: SNIPER CALIBRATION ---
 def calibrate_time_specific_threshold(symbol, time_window_sec, lookback_days, percentile, time_slice_minutes):
-    from_time = datetime.now() - timedelta(days=lookback_days)
-    ticks = mt5.copy_ticks_from(symbol, from_time, 1000000, mt5.COPY_TICKS_ALL) 
-    
-    if ticks is None or len(ticks) < 1000: return None
-        
-    df = pd.DataFrame(ticks)
-    df['time'] = pd.to_datetime(df['time'], unit='s')
-    
-    # Minute of day
-    df['minute_of_day'] = df['time'].dt.hour * 60 + df['time'].dt.minute
-    
     now = datetime.now()
-    current_minute_of_day = now.hour * 60 + now.minute
-    min_bound = current_minute_of_day - time_slice_minutes
-    max_bound = current_minute_of_day + time_slice_minutes
-    
-    if min_bound < 0:
-        mask = (df['minute_of_day'] >= (1440 + min_bound)) | (df['minute_of_day'] <= max_bound)
-    elif max_bound > 1440:
-        mask = (df['minute_of_day'] >= min_bound) | (df['minute_of_day'] <= (max_bound - 1440))
-    else:
-        mask = (df['minute_of_day'] >= min_bound) & (df['minute_of_day'] <= max_bound)
-        
-    df_filtered = df.loc[mask].copy()
-    if df_filtered.empty: return None
-        
-    window_str = f"{time_window_sec}s"
-    df_filtered['window'] = df_filtered['time'].dt.floor(window_str)
-    
     deltas = []
-    for window, group in df_filtered.groupby('window'):
-        if len(group) > 1:
-            delta = abs(group['ask'].iloc[-1] - group['ask'].iloc[0])
-            deltas.append(delta)
-    if not deltas: return None
+    
+    # Loop exactly through the last X days, fetching ONLY the relevant 1-hour slices
+    for i in range(lookback_days):
+        target_time = now - timedelta(days=i)
+        
+        slice_start = target_time - timedelta(minutes=time_slice_minutes)
+        slice_end = target_time + timedelta(minutes=time_slice_minutes)
+        
+        # SNIPER FETCH: Only grab the exact time window we need
+        ticks = mt5.copy_ticks_range(symbol, slice_start, slice_end, mt5.COPY_TICKS_ALL)
+        
+        if ticks is not None and len(ticks) > 10:
+            df = pd.DataFrame(ticks)
+            df['time'] = pd.to_datetime(df['time'], unit='s')
+            
+            window_str = f"{time_window_sec}s"
+            df['window'] = df['time'].dt.floor(window_str)
+            
+            for window, group in df.groupby('window'):
+                if len(group) > 1:
+                    delta = abs(group['ask'].iloc[-1] - group['ask'].iloc[0])
+                    deltas.append(delta)
+                    
+    if not deltas: 
+        return None
     
     deltas_series = pd.Series(deltas)
     threshold = deltas_series.quantile(percentile)
@@ -108,21 +99,16 @@ def run_speed_engine():
     FALLBACK_THRESHOLD = PARAMS['fallback_threshold']
     USE_DYNAMIC_THRESHOLD = PARAMS.get('use_dynamic_threshold', False)
     
-    # Calibration
     CALIB_CONF = PARAMS.get('calibration', {})
-    CALIB_DAYS = CALIB_CONF.get('lookback_days', 5)
-    CALIB_PERCENTILE = CALIB_CONF.get('percentile', 0.5)
-    CALIB_INTERVAL_MIN = CALIB_CONF.get('recalibrate_minutes', 10) 
+    CALIB_DAYS = CALIB_CONF.get('lookback_days', 10)
+    CALIB_PERCENTILE = CALIB_CONF.get('percentile', 0.95)
+    CALIB_INTERVAL_MIN = CALIB_CONF.get('recalibrate_minutes', 2) 
     CALIB_SLICE_MIN = CALIB_CONF.get('time_slice_minutes', 30)
     
-    # RSI Settings (Using stricter 65/35 for Anchor Logic)
     USE_RSI = PARAMS.get('use_rsi_filter', False)
     RSI_PERIOD = PARAMS.get('rsi_period', 14)
     RSI_UPPER = PARAMS.get('rsi_upper', 65) 
     RSI_LOWER = PARAMS.get('rsi_lower', 35) 
-    
-    # MAPPING CONFIG PARAMETER TO ANCHOR LOGIC
-    # The config says "rolling_window", but we use this value as the "Anchor Lookback"
     RSI_ANCHOR_MINUTES = PARAMS.get('rsi_rolling_window_minutes', 60)
     
     RSI_TF_STR = PARAMS.get('rsi_timeframe', 'M1')
@@ -141,7 +127,7 @@ def run_speed_engine():
     if not mt5.symbol_select(SYMBOL, True): sys.exit(1)
 
     if USE_DYNAMIC_THRESHOLD:
-        print(f"init Calibration (Days:{CALIB_DAYS}, Slice:+/-{CALIB_SLICE_MIN}m)...", end="", flush=True)
+        print(f"init Sniper Calibration (Days:{CALIB_DAYS}, Slice:+/-{CALIB_SLICE_MIN}m)...", end="", flush=True)
         calib_success = False
         for attempt in range(10):
             calibrated = calibrate_time_specific_threshold(SYMBOL, TIME_WINDOW_SEC, CALIB_DAYS, CALIB_PERCENTILE, CALIB_SLICE_MIN)
@@ -183,10 +169,14 @@ def run_speed_engine():
         while True:
             # 0. Calibrate
             if USE_DYNAMIC_THRESHOLD and (time.time() - last_calibration_time > RECALIBRATE_INTERVAL_SEC):
-                print(f" [SeasonCalib]...", end='', flush=True) 
+                print(f"\n[SeasonCalib] Recalibrating...", end='', flush=True) 
                 new_threshold = calibrate_time_specific_threshold(SYMBOL, TIME_WINDOW_SEC, CALIB_DAYS, CALIB_PERCENTILE, CALIB_SLICE_MIN)
                 if new_threshold:
                     FALLBACK_THRESHOLD = new_threshold
+                    print(f" Success: {FALLBACK_THRESHOLD:.3f}", flush=True)
+                else:
+                    print(f" Failed: Kept {FALLBACK_THRESHOLD:.3f}", flush=True)
+                
                 last_calibration_time = time.time()
 
             # 1. Ticks
@@ -197,7 +187,7 @@ def run_speed_engine():
                 df = pd.DataFrame(ticks)
                 df['time'] = pd.to_datetime(df['time'], unit='s')
                 
-                # 2. RSI Update (ANCHOR LOGIC)
+                # 2. RSI Update
                 if USE_RSI and (time.time() - last_rsi_check > 2):
                     fetch_count = max(100, RSI_ANCHOR_MINUTES + 10)
                     rates = mt5.copy_rates_from_pos(SYMBOL, SELECTED_TF, 0, fetch_count)
@@ -207,9 +197,6 @@ def run_speed_engine():
                         rsi_series = calculate_rsi_series(df_rates['close'], RSI_PERIOD)
                         
                         current_rsi = rsi_series.iloc[-1]
-                        
-                        # --- TIME MACHINE LOGIC ---
-                        # We grab the value from exactly X minutes ago
                         lookback_idx = min(len(rsi_series)-1, RSI_ANCHOR_MINUTES)
                         anchor_rsi = rsi_series.iloc[-lookback_idx]
                         
@@ -232,7 +219,6 @@ def run_speed_engine():
                         if anchor_rsi > RSI_UPPER: bias = "HOT (Allow Sell)"
                         elif anchor_rsi < RSI_LOWER: bias = "COLD (Allow Buy)"
                         
-                        # LOGGING: Clear "Past" value
                         rsi_txt = f"Curr:{current_rsi:.1f} | Past(-{RSI_ANCHOR_MINUTES}m):{anchor_rsi:.1f} [{bias}]"
                     else:
                         rsi_txt = "OFF"
@@ -244,16 +230,8 @@ def run_speed_engine():
                         is_valid = False 
                         
                         if USE_RSI:
-                            # --- ANCHOR LOGIC ---
-                            # 1. Past High (>65) -> ALLOW SELL
-                            if action == "SELL" and anchor_rsi > RSI_UPPER:
-                                is_valid = True
-                            
-                            # 2. Past Low (<35) -> ALLOW BUY
-                            elif action == "BUY" and anchor_rsi < RSI_LOWER:
-                                is_valid = True
-                            
-                            # 3. Neutral -> BLOCK
+                            if action == "SELL" and anchor_rsi > RSI_UPPER: is_valid = True
+                            elif action == "BUY" and anchor_rsi < RSI_LOWER: is_valid = True
                         else:
                             is_valid = True
 

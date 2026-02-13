@@ -22,7 +22,7 @@
         "cooldown_sec": 5,
         "use_dynamic_threshold": true,
         "fallback_threshold": 0.5,
-        "use_rsi_filter": true,
+        "use_rsi_filter": false,
         "rsi_period": 14,
         "rsi_upper": 65,
         "rsi_lower": 35,

@@ -39,31 +39,36 @@ def calculate_rsi_series(prices, period=14):
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
-def calculate_volatility_tp(df, limits):
+# --- UPDATED: HFT TP CALCULATION (Using raw NumPy array) ---
+def calculate_volatility_tp(ticks_array, limits):
     if not limits.get('use_volatility_based_tp', False): return limits.get('tp_points', 1.0)
-    lookback = limits.get('volatility_lookback_sec', 60)
+    
+    # Use exact milliseconds
+    lookback_ms = limits.get('volatility_lookback_sec', 60) * 1000
+    current_msc = ticks_array[-1]['time_msc']
+    cutoff_msc = current_msc - lookback_ms
+    
+    # Fast NumPy filtering
+    recent_vol = ticks_array[ticks_array['time_msc'] >= cutoff_msc]
+    if len(recent_vol) == 0: return limits.get('tp_points', 1.0)
+    
+    high = np.max(recent_vol['ask'])
+    low = np.min(recent_vol['ask'])
     multiplier = limits.get('tp_volatility_multiplier', 0.5)
-    last_tick_time = df['time'].iloc[-1]
-    cutoff = last_tick_time - pd.Timedelta(seconds=lookback)
-    recent_vol = df[df['time'] >= cutoff]
-    if recent_vol.empty: return limits.get('tp_points', 1.0)
-    high = recent_vol['ask'].max()
-    low = recent_vol['ask'].min()
+    
     return float(max(limits.get('min_tp_points', 0.5), min((high - low) * multiplier, limits.get('max_tp_points', 5.0))))
 
-# --- NEW: SNIPER CALIBRATION ---
+# --- SNIPER CALIBRATION ---
 def calibrate_time_specific_threshold(symbol, time_window_sec, lookback_days, percentile, time_slice_minutes):
     now = datetime.now()
     deltas = []
     
-    # Loop exactly through the last X days, fetching ONLY the relevant 1-hour slices
     for i in range(lookback_days):
         target_time = now - timedelta(days=i)
         
         slice_start = target_time - timedelta(minutes=time_slice_minutes)
         slice_end = target_time + timedelta(minutes=time_slice_minutes)
         
-        # SNIPER FETCH: Only grab the exact time window we need
         ticks = mt5.copy_ticks_range(symbol, slice_start, slice_end, mt5.COPY_TICKS_ALL)
         
         if ticks is not None and len(ticks) > 10:
@@ -153,9 +158,9 @@ def run_speed_engine():
 
     socket = connect_zmq()
     print(f"✓ ZMQ connected. Strategy: {MY_STRATEGY_ID}")
-    print(f"✓ SPEED: M1 Ticks | EDGE: Anchor Point (RSI @ -{RSI_ANCHOR_MINUTES}m)")
+    print(f"✓ SPEED: M1 Ticks (HFT Millisecond Core) | EDGE: Anchor Point (RSI @ -{RSI_ANCHOR_MINUTES}m)")
 
-    last_processed_tick_time = None
+    last_processed_tick_msc = 0
     last_rsi_check = 0
     last_calibration_time = time.time()
     RECALIBRATE_INTERVAL_SEC = CALIB_INTERVAL_MIN * 60
@@ -167,7 +172,7 @@ def run_speed_engine():
 
     try:
         while True:
-            # 0. Calibrate
+            # 0. Calibrate (Runs in background)
             if USE_DYNAMIC_THRESHOLD and (time.time() - last_calibration_time > RECALIBRATE_INTERVAL_SEC):
                 print(f"\n[SeasonCalib] Recalibrating...", end='', flush=True) 
                 new_threshold = calibrate_time_specific_threshold(SYMBOL, TIME_WINDOW_SEC, CALIB_DAYS, CALIB_PERCENTILE, CALIB_SLICE_MIN)
@@ -176,18 +181,23 @@ def run_speed_engine():
                     print(f" Success: {FALLBACK_THRESHOLD:.3f}", flush=True)
                 else:
                     print(f" Failed: Kept {FALLBACK_THRESHOLD:.3f}", flush=True)
-                
                 last_calibration_time = time.time()
 
-            # 1. Ticks
-            from_time = datetime.now() - timedelta(minutes=5)
-            ticks = mt5.copy_ticks_from(SYMBOL, from_time, 2000, mt5.COPY_TICKS_ALL)
+            # 1. HFT Tick Fetching (Raw Array, 0 means latest)
+            # Fetching 5000 ticks guarantees we have enough for both the 2-sec speed and the 60-sec TP calculation.
+            ticks = mt5.copy_ticks_from_pos(SYMBOL, 0, 5000, mt5.COPY_TICKS_ALL)
             
             if ticks is not None and len(ticks) > 10:
-                df = pd.DataFrame(ticks)
-                df['time'] = pd.to_datetime(df['time'], unit='s')
+                current_tick = ticks[-1]
+                current_msc = current_tick['time_msc']
                 
-                # 2. RSI Update
+                # Prevent processing the exact same micro-tick twice
+                if last_processed_tick_msc == current_msc:
+                    time.sleep(0.005) # Tiny sleep to avoid redlining the CPU
+                    continue
+                last_processed_tick_msc = current_msc
+                
+                # 2. RSI Update (Runs every 2 seconds to save CPU)
                 if USE_RSI and (time.time() - last_rsi_check > 2):
                     fetch_count = max(100, RSI_ANCHOR_MINUTES + 10)
                     rates = mt5.copy_rates_from_pos(SYMBOL, SELECTED_TF, 0, fetch_count)
@@ -202,17 +212,14 @@ def run_speed_engine():
                         
                     last_rsi_check = time.time()
 
-                data_now = df.iloc[-1]['time']
-                if last_processed_tick_time == data_now:
-                    time.sleep(0.01)
-                    continue
-                last_processed_tick_time = data_now
-
-                cutoff = data_now - pd.Timedelta(seconds=TIME_WINDOW_SEC)
-                recent = df[df['time'] >= cutoff]
+                # 3. MILLISECOND VELOCITY CALCULATION
+                cutoff_msc = current_msc - (TIME_WINDOW_SEC * 1000)
                 
-                if not recent.empty:
-                    delta = recent.iloc[-1]['ask'] - recent.iloc[0]['ask']
+                # Extremely fast NumPy boolean indexing
+                valid_ticks = ticks[ticks['time_msc'] >= cutoff_msc]
+                
+                if len(valid_ticks) > 1:
+                    delta = valid_ticks[-1]['ask'] - valid_ticks[0]['ask']
                     
                     if USE_RSI:
                         bias = "NEUTRAL (Block)"
@@ -236,7 +243,7 @@ def run_speed_engine():
                             is_valid = True
 
                         if is_valid:
-                            tp = calculate_volatility_tp(df, TRADE_LIMITS) if USE_VOL_TP else TP_POINTS
+                            tp = calculate_volatility_tp(ticks, TRADE_LIMITS) if USE_VOL_TP else TP_POINTS
                             signal_count += 1
                             ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
                             print(f"\n[{ts}] 🚀 SIGNAL #{signal_count} | {action} | Speed: {delta:+.6f} | TP: {tp:.2f}", flush=True)
@@ -256,7 +263,7 @@ def run_speed_engine():
                             
                             time.sleep(COOLDOWN_SEC)
 
-            time.sleep(0.01)
+            time.sleep(0.005)
 
     except KeyboardInterrupt: print("\nStopped.")
     finally: mt5.shutdown(); socket.close(); context.term()

@@ -183,9 +183,10 @@ def run_speed_engine():
                     print(f" Failed: Kept {FALLBACK_THRESHOLD:.3f}", flush=True)
                 last_calibration_time = time.time()
 
-            # 1. HFT Tick Fetching (Raw Array, 0 means latest)
-            # Fetching 5000 ticks guarantees we have enough for both the 2-sec speed and the 60-sec TP calculation.
-            ticks = mt5.copy_ticks_from_pos(SYMBOL, 0, 5000, mt5.COPY_TICKS_ALL)
+            # 1. HFT Tick Fetching (Raw Array via Exact Time Range)
+            # Fetch exactly the last 90 seconds to cover the 60s TP lookback and 2s Speed window
+            from_time = datetime.now() - timedelta(seconds=90)
+            ticks = mt5.copy_ticks_range(SYMBOL, from_time, datetime.now(), mt5.COPY_TICKS_ALL)
             
             if ticks is not None and len(ticks) > 10:
                 current_tick = ticks[-1]

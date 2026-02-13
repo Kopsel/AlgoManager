@@ -39,13 +39,13 @@
           "lookback_minutes": 60,
           "base_volume": 0.05,
           "grind_zone": {
-            "skew_threshold": 5,
-            "with_trend_volume": 0.08,
+            "skew_threshold": 20,
+            "with_trend_volume": 0.07,
             "fade_trend_volume": 0.02
           },
           "runaway_zone": {
-            "skew_threshold": 10,
-            "with_trend_volume": 0.12,
+            "skew_threshold": 50,
+            "with_trend_volume": 0.10,
             "fade_trend_volume": 0.00
           }
         }

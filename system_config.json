@@ -24,8 +24,8 @@
         "fallback_threshold": 0.5,
         "use_rsi_filter": true,
         "rsi_period": 14,
-        "rsi_upper": 55,
-        "rsi_lower": 45,
+        "rsi_upper": 65,
+        "rsi_lower": 35,
         "rsi_timeframe": "M1",
         "rsi_rolling_window_minutes": 60,
         "calibration": {

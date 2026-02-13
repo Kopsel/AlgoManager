@@ -70,7 +70,6 @@ def calibrate_time_specific_threshold(symbol, time_window_sec, lookback_days, pe
     min_bound = current_minute_of_day - time_slice_minutes
     max_bound = current_minute_of_day + time_slice_minutes
     
-    # Handle Midnight
     if min_bound < 0:
         mask = (df['minute_of_day'] >= (1440 + min_bound)) | (df['minute_of_day'] <= max_bound)
     elif max_bound > 1440:
@@ -116,14 +115,15 @@ def run_speed_engine():
     CALIB_INTERVAL_MIN = CALIB_CONF.get('recalibrate_minutes', 10) 
     CALIB_SLICE_MIN = CALIB_CONF.get('time_slice_minutes', 30)
     
-    # RSI
+    # RSI Settings (Using stricter 65/35 for Anchor Logic)
     USE_RSI = PARAMS.get('use_rsi_filter', False)
     RSI_PERIOD = PARAMS.get('rsi_period', 14)
-    RSI_UPPER = PARAMS.get('rsi_upper', 55) # Default 55 per request
-    RSI_LOWER = PARAMS.get('rsi_lower', 45) # Default 45 per request
+    RSI_UPPER = PARAMS.get('rsi_upper', 65) 
+    RSI_LOWER = PARAMS.get('rsi_lower', 35) 
     
-    # Rolling Mean Window
-    RSI_MEAN_WINDOW = PARAMS.get('rsi_rolling_window_minutes', 60)
+    # MAPPING CONFIG PARAMETER TO ANCHOR LOGIC
+    # The config says "rolling_window", but we use this value as the "Anchor Lookback"
+    RSI_ANCHOR_MINUTES = PARAMS.get('rsi_rolling_window_minutes', 60)
     
     RSI_TF_STR = PARAMS.get('rsi_timeframe', 'M1')
     TIMEFRAME_MAP = {
@@ -140,7 +140,6 @@ def run_speed_engine():
     if not mt5.initialize(): sys.exit(1)
     if not mt5.symbol_select(SYMBOL, True): sys.exit(1)
 
-    # --- INITIAL CALIBRATION (Retry Loop) ---
     if USE_DYNAMIC_THRESHOLD:
         print(f"init Calibration (Days:{CALIB_DAYS}, Slice:+/-{CALIB_SLICE_MIN}m)...", end="", flush=True)
         calib_success = False
@@ -168,7 +167,7 @@ def run_speed_engine():
 
     socket = connect_zmq()
     print(f"✓ ZMQ connected. Strategy: {MY_STRATEGY_ID}")
-    print(f"✓ SPEED: M1 Ticks | RSI REGIME: Rolling Mean of last {RSI_MEAN_WINDOW} mins")
+    print(f"✓ SPEED: M1 Ticks | EDGE: Anchor Point (RSI @ -{RSI_ANCHOR_MINUTES}m)")
 
     last_processed_tick_time = None
     last_rsi_check = 0
@@ -176,7 +175,7 @@ def run_speed_engine():
     RECALIBRATE_INTERVAL_SEC = CALIB_INTERVAL_MIN * 60
 
     current_rsi = 50.0
-    mean_rsi = 50.0 # Rolling Average
+    anchor_rsi = 50.0 
     
     signal_count = 0
 
@@ -198,9 +197,9 @@ def run_speed_engine():
                 df = pd.DataFrame(ticks)
                 df['time'] = pd.to_datetime(df['time'], unit='s')
                 
-                # 2. RSI Update (ROLLING MEAN)
+                # 2. RSI Update (ANCHOR LOGIC)
                 if USE_RSI and (time.time() - last_rsi_check > 2):
-                    fetch_count = max(100, RSI_MEAN_WINDOW + 20)
+                    fetch_count = max(100, RSI_ANCHOR_MINUTES + 10)
                     rates = mt5.copy_rates_from_pos(SYMBOL, SELECTED_TF, 0, fetch_count)
                     
                     if rates is not None and len(rates) > RSI_PERIOD:
@@ -209,9 +208,10 @@ def run_speed_engine():
                         
                         current_rsi = rsi_series.iloc[-1]
                         
-                        # CALCULATE ROLLING MEAN
-                        subset = rsi_series.iloc[-RSI_MEAN_WINDOW:]
-                        mean_rsi = subset.mean()
+                        # --- TIME MACHINE LOGIC ---
+                        # We grab the value from exactly X minutes ago
+                        lookback_idx = min(len(rsi_series)-1, RSI_ANCHOR_MINUTES)
+                        anchor_rsi = rsi_series.iloc[-lookback_idx]
                         
                     last_rsi_check = time.time()
 
@@ -228,14 +228,12 @@ def run_speed_engine():
                     delta = recent.iloc[-1]['ask'] - recent.iloc[0]['ask']
                     
                     if USE_RSI:
-                        # Direct Config Usage
                         bias = "NEUTRAL (Block)"
+                        if anchor_rsi > RSI_UPPER: bias = "HOT (Allow Sell)"
+                        elif anchor_rsi < RSI_LOWER: bias = "COLD (Allow Buy)"
                         
-                        if mean_rsi > RSI_UPPER: bias = "HOT (Allow Sell)"
-                        elif mean_rsi < RSI_LOWER: bias = "COLD (Allow Buy)"
-                        
-                        # LOGGING: Added Avg(...) output
-                        rsi_txt = f"Curr:{current_rsi:.1f} | Avg({RSI_MEAN_WINDOW}m):{mean_rsi:.1f} [{bias}]"
+                        # LOGGING: Clear "Past" value
+                        rsi_txt = f"Curr:{current_rsi:.1f} | Past(-{RSI_ANCHOR_MINUTES}m):{anchor_rsi:.1f} [{bias}]"
                     else:
                         rsi_txt = "OFF"
                         
@@ -246,17 +244,16 @@ def run_speed_engine():
                         is_valid = False 
                         
                         if USE_RSI:
-                            # LOGIC: Fade the Regime using Exact Config Values
-                            
-                            # 1. Hot Regime (> 55) -> ALLOW SELLS
-                            if action == "SELL" and mean_rsi > RSI_UPPER:
+                            # --- ANCHOR LOGIC ---
+                            # 1. Past High (>65) -> ALLOW SELL
+                            if action == "SELL" and anchor_rsi > RSI_UPPER:
                                 is_valid = True
                             
-                            # 2. Cold Regime (< 45) -> ALLOW BUYS
-                            elif action == "BUY" and mean_rsi < RSI_LOWER:
+                            # 2. Past Low (<35) -> ALLOW BUY
+                            elif action == "BUY" and anchor_rsi < RSI_LOWER:
                                 is_valid = True
-                                
-                            # 3. Neutral (45-55) -> BLOCK ALL
+                            
+                            # 3. Neutral -> BLOCK
                         else:
                             is_valid = True
 

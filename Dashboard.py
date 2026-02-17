@@ -1,7 +1,7 @@
 import streamlit as st
 import time
 import MetaTrader5 as mt5
-import pandas as pd # Ensure pandas is imported for date parsing
+import pandas as pd 
 from datetime import datetime, timedelta
 
 # Import Components
@@ -25,43 +25,49 @@ if 'data_restored' not in st.session_state:
         st.session_state['daily_pnl'] = stats['daily_pnl']
         st.session_state['daily_trades'] = stats['trade_count']
         
-        # B. Restore Trade History
-        recent_trades = db.fetch_trades(limit=50)
-        st.session_state['history_data'] = recent_trades
-        
-        # C. Restore Equity Curve (With Fix for NaN Error)
-        equity_raw = db.fetch_equity_history(limit=500)
+        # B. Restore Equity Curve (FIXED: Load Equity, not Trades)
+        equity_raw = db.fetch_equity_history(limit=200) # Match live monitor limit
         equity_clean = []
         
         for row in equity_raw:
             d = dict(row)
             
-            # --- THE FIX: Convert DB Timestamp to Unix Float ---
+            # --- MAP DB COLUMNS TO CHART KEYS ---
+            # DB uses lowercase, Charts expect Capitalized
+            clean_row = {
+                'Balance': d['balance'],
+                'Equity': d['equity'],
+            }
+            
+            # Generate Unix Timestamp
             if 'timestamp' in d:
                 try:
-                    # Robust parsing using pandas (handles strings & datetime objects)
                     ts = pd.to_datetime(d['timestamp'])
-                    d['time_unix'] = ts.timestamp()
+                    clean_row['time_unix'] = ts.timestamp()
+                    # Also keep readable time for debug/tables if needed
+                    clean_row['time'] = ts.strftime('%H:%M:%S')
                 except Exception:
-                    # If parsing fails, skip this point or use current time
                     continue 
             
-            equity_clean.append(d)
+            equity_clean.append(clean_row)
         
         # DB returns Newest->Oldest. Charts want Oldest->Newest.
         equity_clean.reverse()
         
-        st.session_state['equity_history'] = equity_clean
+        # --- CRITICAL FIX: Assign to 'history_data' ---
+        # This variable powers the Live Pulse charts.
+        st.session_state['history_data'] = equity_clean
+        st.session_state['session_full_history'] = equity_clean.copy()
         
         st.session_state['data_restored'] = True
-        print(f"Dashboard: Restored State (PnL: {stats['daily_pnl']} | Hist: {len(recent_trades)} | Eq: {len(equity_clean)})")
+        print(f"Dashboard: Restored {len(equity_clean)} Equity Snapshots")
         
     except Exception as e:
         print(f"Dashboard Load Error: {e}")
         st.session_state['daily_pnl'] = 0.0
         st.session_state['daily_trades'] = 0
         st.session_state['history_data'] = []
-        st.session_state['equity_history'] = []
+        st.session_state['session_full_history'] = []
 
 # --- 2. SESSION STATE INITIALIZATION ---
 if 'history_data' not in st.session_state:
@@ -76,7 +82,6 @@ if 'reset_ticket_threshold' not in st.session_state:
         path = config['system'].get('mt5_terminal_path')
         if init_mt5(path):
             now = datetime.now()
-            # Look back 7 days to find the very last ticket ID
             recents = mt5.history_deals_get(now - timedelta(days=7), now + timedelta(days=1))
             if recents and len(recents) > 0:
                 st.session_state.reset_ticket_threshold = recents[-1].ticket
@@ -104,7 +109,6 @@ def main():
         if st.button("🔄 Reset Tracking Today", type="primary"):
             st.session_state.history_data = []
             st.session_state.session_full_history = []
-            st.session_state['equity_history'] = []
             
             st.session_state['daily_pnl'] = 0.0
             st.session_state['daily_trades'] = 0

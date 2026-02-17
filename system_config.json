@@ -45,7 +45,7 @@
           },
           "runaway_zone": {
             "skew_threshold": 25,
-            "with_trend_volume": 0.3,
+            "with_trend_volume": 0.03,
             "fade_trend_volume": 0.00
           }
         }

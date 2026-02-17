@@ -37,15 +37,15 @@
         "dynamic_sizing": {
           "enabled": true,
           "lookback_minutes": 60,
-          "base_volume": 0.05,
+          "base_volume": 0.02,
           "grind_zone": {
-            "skew_threshold": 20,
-            "with_trend_volume": 0.07,
-            "fade_trend_volume": 0.02
+            "skew_threshold": 10,
+            "with_trend_volume": 0.02,
+            "fade_trend_volume": 0.01
           },
           "runaway_zone": {
-            "skew_threshold": 50,
-            "with_trend_volume": 0.10,
+            "skew_threshold": 25,
+            "with_trend_volume": 0.3,
             "fade_trend_volume": 0.00
           }
         }

@@ -130,30 +130,23 @@ def check_closed_trades():
     If missing, queries history BY TICKET ID (Timezone proof).
     Retries until history is found.
     """
-    # 1. Get all currently open tickets
     live_positions = mt5.positions_get()
     if live_positions is None: return 
     live_ticket_ids = {p.ticket for p in live_positions}
     
-    # 2. Find tickets that disappeared (Closed)
     missing_tickets = [t for t in tracked_tickets.keys() if t not in live_ticket_ids]
     
     for ticket in missing_tickets:
         strat_id = tracked_tickets[ticket]
         
-        # 3. Request History SPECIFICALLY for this POSITION
-        # 'position=ticket' gets both Entry (IN) and Exit (OUT)
         deals = mt5.history_deals_get(position=ticket)
         
-        # If history is not ready yet, SKIP. Try next loop.
         if deals is None or len(deals) == 0:
             continue
             
-        # 4. Look for the EXIT deal
         entry_deal = next((d for d in deals if d.entry == mt5.DEAL_ENTRY_IN), None)
         exit_deal = next((d for d in deals if d.entry in [mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_INOUT]), None)
         
-        # We need the Exit to log PnL.
         if exit_deal:
             meta = trade_metadata.get(ticket, {})
             
@@ -191,10 +184,8 @@ def check_closed_trades():
                 "extra_metrics": meta 
             }
             
-            # 5. Log to DB
             db.log_trade(trade_record)
             
-            # 6. STOP TRACKING (Success)
             del tracked_tickets[ticket]
             if ticket in trade_metadata: del trade_metadata[ticket]
 
@@ -218,7 +209,7 @@ def close_all_positions(reason="Global Basket Trigger"):
             "volume": pos.volume,
             "type": type_close,
             "price": price,
-            "magic": pos.magic, # IMPORTANT: Pass original magic to track correctly
+            "magic": pos.magic,
             "comment": "Basket Close",
         }
         mt5.order_send(request)
@@ -226,7 +217,6 @@ def close_all_positions(reason="Global Basket Trigger"):
 def check_basket_logic():
     global system_locked
     
-    # If locked, stop checking (waiting for restart)
     if system_locked: return
 
     load_config() 
@@ -270,8 +260,12 @@ def execute_trade(signal_data):
     
     symbol = signal_data['symbol']
     action = signal_data['action']
-    volume = settings['volume']
     magic = settings['magic_number']
+    
+    if 'volume' in signal_data and float(signal_data['volume']) > 0:
+        volume = float(signal_data['volume'])
+    else:
+        volume = settings['volume']
     
     limits = settings.get('trade_limits', {})
     sl_points = limits.get('sl_points', 0)
@@ -317,11 +311,10 @@ def execute_trade(signal_data):
     # --- 3. TRACKING & METADATA ---
     tracked_tickets[result.order] = strat_id
     
-    # Store the extra metrics (Speed, RSI) for later logging to DB
     if 'extra_metrics' in signal_data:
         trade_metadata[result.order] = signal_data['extra_metrics']
         
-    return f"Manager: OPENED {action} (Ticket: {result.order})"
+    return f"Manager: OPENED {action} (Ticket: {result.order}) | Vol: {volume}"
 
 def run_manager():
     if not load_config(): return
@@ -354,7 +347,7 @@ def run_manager():
         try:
             try:
                 msg = socket.recv_json(flags=zmq.NOBLOCK)
-                print(f"Manager: Signal -> {msg['strategy_id']} {msg['action']}")
+                print(f"Manager: Signal -> {msg['strategy_id']} {msg['action']} (Vol: {msg.get('volume', 'Default')})")
                 resp = execute_trade(msg)
                 socket.send_string(resp)
             except zmq.Again:
@@ -367,7 +360,7 @@ def run_manager():
             check_closed_trades()
             check_basket_logic()
             record_equity_snapshot()
-            time.sleep(0.01) # Faster loop for responsiveness
+            time.sleep(0.01)
 
         except KeyboardInterrupt:
             print("Manager: Shutting down...")

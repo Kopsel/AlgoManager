@@ -2,7 +2,7 @@ import streamlit as st
 import time
 import MetaTrader5 as mt5
 import pandas as pd 
-import json # NEW: Needed for parsing strategy performance
+import json 
 from datetime import datetime, timedelta
 
 # Import Components
@@ -16,17 +16,17 @@ from components.database import Database
 
 st.set_page_config(page_title="Algo Command", layout="wide")
 
-# --- 1. DATABASE STATE RESTORATION (The Persistence Layer) ---
+# --- 1. DATABASE STATE RESTORATION ---
 if 'data_restored' not in st.session_state:
     try:
         db = Database()
         
-        # A. Restore Daily Stats
+        # A. Restore Daily Stats (PnL & Count)
         stats = db.get_todays_stats()
         st.session_state['daily_pnl'] = stats['daily_pnl']
         st.session_state['daily_trades'] = stats['trade_count']
         
-        # B. Restore Equity Curve (With Strategy Attribution)
+        # B. Restore Equity Curve
         equity_raw = db.fetch_equity_history(limit=200) 
         equity_clean = []
         
@@ -38,17 +38,16 @@ if 'data_restored' not in st.session_state:
                 'Equity': d['equity'],
             }
             
-            # --- UNPACK STRATEGY PERFORMANCE ---
+            # Unpack Strategy Performance
             if 'strategy_performance' in d and d['strategy_performance']:
                 try:
                     strat_data = json.loads(d['strategy_performance'])
-                    # Flatten into PL_StrategyName format
                     for k, v in strat_data.items():
                         clean_row[f"PL_{k}"] = v
                 except:
-                    pass # Ignore JSON errors
+                    pass 
             
-            # --- TIMEZONE FIX ---
+            # Timezone Fix
             if 'timestamp' in d:
                 try:
                     ts_pandas = pd.to_datetime(d['timestamp'])
@@ -62,12 +61,11 @@ if 'data_restored' not in st.session_state:
         
         equity_clean.reverse()
         
-        # Assign to History
         st.session_state['history_data'] = equity_clean
         st.session_state['session_full_history'] = equity_clean.copy()
         
         st.session_state['data_restored'] = True
-        print(f"Dashboard: Restored {len(equity_clean)} Snapshots (Full Attribution)")
+        print(f"Dashboard: Restored {len(equity_clean)} Snapshots")
         
     except Exception as e:
         print(f"Dashboard Load Error: {e}")
@@ -82,17 +80,25 @@ if 'history_data' not in st.session_state:
 if 'session_full_history' not in st.session_state:
     st.session_state.session_full_history = [] 
 
-# Initialize Reset Threshold to CURRENT LATEST TICKET on startup
+# --- CRITICAL FIX: Initialize Reset Threshold to MIDNIGHT ---
 if 'reset_ticket_threshold' not in st.session_state:
     config = load_config()
     if config:
         path = config['system'].get('mt5_terminal_path')
         if init_mt5(path):
+            # 1. Define Midnight (Start of current day)
             now = datetime.now()
-            recents = mt5.history_deals_get(now - timedelta(days=7), now + timedelta(days=1))
-            if recents and len(recents) > 0:
-                st.session_state.reset_ticket_threshold = recents[-1].ticket
+            midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            
+            # 2. Find the last ticket BEFORE midnight
+            # We fetch history ending exactly at midnight
+            history_before = mt5.history_deals_get(midnight - timedelta(days=7), midnight)
+            
+            if history_before and len(history_before) > 0:
+                # The threshold is the last trade of yesterday
+                st.session_state.reset_ticket_threshold = history_before[-1].ticket
             else:
+                # If no trades before midnight (fresh account), threshold is 0
                 st.session_state.reset_ticket_threshold = 0
         else:
             st.session_state.reset_ticket_threshold = 0
@@ -120,6 +126,7 @@ def main():
             st.session_state['daily_pnl'] = 0.0
             st.session_state['daily_trades'] = 0
             
+            # Reset Threshold to CURRENT latest ticket (effectively clearing today's history from view)
             now = datetime.now()
             deals = mt5.history_deals_get(now - timedelta(days=7), now + timedelta(days=1))
             if deals and len(deals) > 0:
@@ -149,7 +156,7 @@ def main():
                 global_net_lots -= pos.volume
                 global_net_count -= 1
 
-    # Determine Direction String & Color
+    # Determine Direction
     if global_net_lots > 0:
         direction_str = "LONG 🐂"
         delta_color = "normal" 

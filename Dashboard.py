@@ -1,6 +1,7 @@
 import streamlit as st
 import time
 import MetaTrader5 as mt5
+import pandas as pd # Ensure pandas is imported for date parsing
 from datetime import datetime, timedelta
 
 # Import Components
@@ -10,33 +11,50 @@ from components.strategy_lab import render_strategy_lab
 from components.history import render_history_tab
 from components.journal import render_journal_tab 
 from components.analytics import render_analytics_tab
-from components.database import Database  # <--- DB Import
+from components.database import Database
 
 st.set_page_config(page_title="Algo Command", layout="wide")
 
 # --- 1. DATABASE STATE RESTORATION (The Persistence Layer) ---
-# This block runs once on startup/refresh to reload data from disk.
 if 'data_restored' not in st.session_state:
     try:
         db = Database()
         
-        # A. Restore Daily Stats (PnL & Count)
+        # A. Restore Daily Stats
         stats = db.get_todays_stats()
         st.session_state['daily_pnl'] = stats['daily_pnl']
         st.session_state['daily_trades'] = stats['trade_count']
         
-        # B. Restore Trade History (Last 50 trades for the Table)
-        # We populate 'history_data' so the History Tab isn't empty
+        # B. Restore Trade History
         recent_trades = db.fetch_trades(limit=50)
         st.session_state['history_data'] = recent_trades
         
-        # C. Restore Equity Curve (Last 500 snapshots for Analytics)
-        # We store this in a new session var for the Analytics component to use
-        equity_curve = db.fetch_equity_history(limit=500)
-        st.session_state['equity_history'] = equity_curve
+        # C. Restore Equity Curve (With Fix for NaN Error)
+        equity_raw = db.fetch_equity_history(limit=500)
+        equity_clean = []
+        
+        for row in equity_raw:
+            d = dict(row)
+            
+            # --- THE FIX: Convert DB Timestamp to Unix Float ---
+            if 'timestamp' in d:
+                try:
+                    # Robust parsing using pandas (handles strings & datetime objects)
+                    ts = pd.to_datetime(d['timestamp'])
+                    d['time_unix'] = ts.timestamp()
+                except Exception:
+                    # If parsing fails, skip this point or use current time
+                    continue 
+            
+            equity_clean.append(d)
+        
+        # DB returns Newest->Oldest. Charts want Oldest->Newest.
+        equity_clean.reverse()
+        
+        st.session_state['equity_history'] = equity_clean
         
         st.session_state['data_restored'] = True
-        print(f"Dashboard: Restored State (PnL: {stats['daily_pnl']} | Hist: {len(recent_trades)} | Eq: {len(equity_curve)})")
+        print(f"Dashboard: Restored State (PnL: {stats['daily_pnl']} | Hist: {len(recent_trades)} | Eq: {len(equity_clean)})")
         
     except Exception as e:
         print(f"Dashboard Load Error: {e}")
@@ -58,7 +76,7 @@ if 'reset_ticket_threshold' not in st.session_state:
         path = config['system'].get('mt5_terminal_path')
         if init_mt5(path):
             now = datetime.now()
-            # Look back 7 days to find the very last ticket ID to avoid re-alerting old trades
+            # Look back 7 days to find the very last ticket ID
             recents = mt5.history_deals_get(now - timedelta(days=7), now + timedelta(days=1))
             if recents and len(recents) > 0:
                 st.session_state.reset_ticket_threshold = recents[-1].ticket
@@ -84,16 +102,13 @@ def main():
     with st.sidebar:
         st.header("Session Controls")
         if st.button("🔄 Reset Tracking Today", type="primary"):
-            # Clear Memory
             st.session_state.history_data = []
             st.session_state.session_full_history = []
             st.session_state['equity_history'] = []
             
-            # Reset UI Metrics (DB remains intact, this just clears the view)
             st.session_state['daily_pnl'] = 0.0
             st.session_state['daily_trades'] = 0
             
-            # Reset MT5 Ticket Threshold
             now = datetime.now()
             deals = mt5.history_deals_get(now - timedelta(days=7), now + timedelta(days=1))
             if deals and len(deals) > 0:
@@ -103,7 +118,7 @@ def main():
             st.success("Session View Reset!")
             st.rerun()
 
-    # --- CALCULATE LIVE METRICS (GLOBAL EXPOSURE) ---
+    # --- CALCULATE LIVE METRICS ---
     acc = mt5.account_info()
     strategies = config.get('strategies', {})
     
@@ -138,7 +153,6 @@ def main():
     if acc:
         kpi1, kpi2, kpi3, kpi4, kpi5, kpi6 = st.columns(6)
         
-        # 1. Money Stats
         kpi1.metric("Balance", f"${acc.balance:,.2f}")
         kpi2.metric("Equity", f"${acc.equity:,.2f}", delta=f"{acc.equity - acc.balance:.2f}")
         
@@ -162,18 +176,14 @@ def main():
         render_strategy_lab(strategies, config)
 
     with tab3:
-        # Pass the persisted history data to the component
         render_history_tab(strategies)
         
     with tab4:
-        # Journal reads directly from DB, so it works automatically
         render_journal_tab()
     
     with tab5:
-        # Ensure Analytics tab uses the session equity history if available
         render_analytics_tab()
 
-    # Auto-Refresh Logic (Poll every 1s)
     time.sleep(1)
     st.rerun()
 

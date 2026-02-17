@@ -25,27 +25,32 @@ if 'data_restored' not in st.session_state:
         st.session_state['daily_pnl'] = stats['daily_pnl']
         st.session_state['daily_trades'] = stats['trade_count']
         
-        # B. Restore Equity Curve (FIXED: Load Equity, not Trades)
-        equity_raw = db.fetch_equity_history(limit=200) # Match live monitor limit
+        # B. Restore Equity Curve (FIXED: Timezone Alignment)
+        equity_raw = db.fetch_equity_history(limit=200) 
         equity_clean = []
         
         for row in equity_raw:
             d = dict(row)
             
-            # --- MAP DB COLUMNS TO CHART KEYS ---
-            # DB uses lowercase, Charts expect Capitalized
             clean_row = {
                 'Balance': d['balance'],
                 'Equity': d['equity'],
             }
             
-            # Generate Unix Timestamp
+            # --- THE TIMEZONE FIX ---
             if 'timestamp' in d:
                 try:
-                    ts = pd.to_datetime(d['timestamp'])
-                    clean_row['time_unix'] = ts.timestamp()
-                    # Also keep readable time for debug/tables if needed
-                    clean_row['time'] = ts.strftime('%H:%M:%S')
+                    # 1. Parse string to Pandas Timestamp
+                    ts_pandas = pd.to_datetime(d['timestamp'])
+                    
+                    # 2. Convert to Python Native Datetime (Naive)
+                    # This ensures .timestamp() uses Local System Time (CET), matching live_monitor.py
+                    ts_python = ts_pandas.to_pydatetime()
+                    
+                    clean_row['time_unix'] = ts_python.timestamp()
+                    
+                    # Optional: Readable string
+                    clean_row['time'] = ts_python.strftime('%H:%M:%S')
                 except Exception:
                     continue 
             
@@ -54,13 +59,12 @@ if 'data_restored' not in st.session_state:
         # DB returns Newest->Oldest. Charts want Oldest->Newest.
         equity_clean.reverse()
         
-        # --- CRITICAL FIX: Assign to 'history_data' ---
-        # This variable powers the Live Pulse charts.
+        # Assign to History
         st.session_state['history_data'] = equity_clean
         st.session_state['session_full_history'] = equity_clean.copy()
         
         st.session_state['data_restored'] = True
-        print(f"Dashboard: Restored {len(equity_clean)} Equity Snapshots")
+        print(f"Dashboard: Restored {len(equity_clean)} Snapshots (TZ Corrected)")
         
     except Exception as e:
         print(f"Dashboard Load Error: {e}")

@@ -4,7 +4,6 @@ import os
 from datetime import datetime
 
 # --- PATH FIX ---
-# Forces the DB to be created in the directory of the main script (Launcher.py), not inside /components
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_FILE = os.path.join(BASE_DIR, "trading_system.db")
 
@@ -20,7 +19,7 @@ class Database:
         return conn
 
     def initialize(self):
-        """Creates tables if they don't exist"""
+        """Creates tables if they don't exist and handles migrations"""
         conn = self.get_connection()
         c = conn.cursor()
         
@@ -45,33 +44,35 @@ class Database:
             )
         ''')
 
+        # Updated Schema: Added strategy_performance
         c.execute('''
             CREATE TABLE IF NOT EXISTS equity_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TIMESTAMP,
                 balance REAL,
                 equity REAL,
-                open_positions INTEGER
+                open_positions INTEGER,
+                strategy_performance TEXT
             )
         ''')
+        
+        # --- MIGRATION: Add column if it doesn't exist (for existing DBs) ---
+        try:
+            c.execute("SELECT strategy_performance FROM equity_history LIMIT 1")
+        except sqlite3.OperationalError:
+            print("Database: Migrating schema... Adding 'strategy_performance' column.")
+            c.execute("ALTER TABLE equity_history ADD COLUMN strategy_performance TEXT")
         
         conn.commit()
         conn.close()
 
     def get_todays_stats(self):
-        """
-        Calculates total trades and PnL for the current day from the DB.
-        This allows the dashboard to persist stats after a refresh.
-        """
         conn = self.get_connection()
         c = conn.cursor()
         try:
-            # Get start of today (Midnight)
             today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
             today_str = today_start.strftime('%Y-%m-%d %H:%M:%S')
             
-            # Query: Total PnL and Trade Count for Today
-            # We filter by close_time >= today at 00:00:00
             c.execute("""
                 SELECT COUNT(*), SUM(pnl) 
                 FROM trades 
@@ -83,7 +84,6 @@ class Database:
             pnl = row[1] if row[1] else 0.0
             
             return {"daily_pnl": pnl, "trade_count": count}
-            
         except Exception as e:
             print(f"DB Read Error: {e}")
             return {"daily_pnl": 0.0, "trade_count": 0}
@@ -91,9 +91,6 @@ class Database:
             conn.close()
 
     def log_trade(self, trade_dict):
-        """
-        Saves a trade to the DB.
-        """
         conn = self.get_connection()
         c = conn.cursor()
         
@@ -101,7 +98,6 @@ class Database:
         meta_json_str = json.dumps(meta_data)
         
         try:
-            # Convert datetime objects to string to ensure SQLite compatibility
             o_time = trade_dict['open_time']
             c_time = trade_dict['close_time']
             if isinstance(o_time, datetime): o_time = o_time.strftime('%Y-%m-%d %H:%M:%S')
@@ -138,15 +134,19 @@ class Database:
         finally:
             conn.close()
 
-    def log_equity_snapshot(self, balance, equity, open_positions):
-        """Logs the current account state"""
+    def log_equity_snapshot(self, balance, equity, open_positions, strategy_data=None):
+        """Logs the current account state including per-strategy breakdown"""
         conn = self.get_connection()
         c = conn.cursor()
+        
+        # Serialize strategy data to JSON
+        strat_json = json.dumps(strategy_data) if strategy_data else "{}"
+        
         try:
             c.execute('''
-                INSERT INTO equity_history (timestamp, balance, equity, open_positions)
-                VALUES (?, ?, ?, ?)
-            ''', (datetime.now(), balance, equity, open_positions))
+                INSERT INTO equity_history (timestamp, balance, equity, open_positions, strategy_performance)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (datetime.now(), balance, equity, open_positions, strat_json))
             conn.commit()
         except Exception as e:
             print(f"DB Snapshot Error: {e}")
@@ -154,7 +154,6 @@ class Database:
             conn.close()
 
     def fetch_equity_history(self, limit=1000):
-        """Fetches equity curve for charting"""
         if not os.path.exists(DB_FILE): return []
         conn = self.get_connection()
         c = conn.cursor()
@@ -165,10 +164,7 @@ class Database:
             conn.close()
 
     def fetch_trades(self, strategy_id=None, limit=100):
-        """Retrieves trades."""
-        if not os.path.exists(DB_FILE):
-            return []
-            
+        if not os.path.exists(DB_FILE): return []
         conn = self.get_connection()
         c = conn.cursor()
         

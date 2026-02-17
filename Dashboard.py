@@ -2,6 +2,7 @@ import streamlit as st
 import time
 import MetaTrader5 as mt5
 import pandas as pd 
+import json # NEW: Needed for parsing strategy performance
 from datetime import datetime, timedelta
 
 # Import Components
@@ -25,7 +26,7 @@ if 'data_restored' not in st.session_state:
         st.session_state['daily_pnl'] = stats['daily_pnl']
         st.session_state['daily_trades'] = stats['trade_count']
         
-        # B. Restore Equity Curve (FIXED: Timezone Alignment)
+        # B. Restore Equity Curve (With Strategy Attribution)
         equity_raw = db.fetch_equity_history(limit=200) 
         equity_clean = []
         
@@ -37,26 +38,28 @@ if 'data_restored' not in st.session_state:
                 'Equity': d['equity'],
             }
             
-            # --- THE TIMEZONE FIX ---
+            # --- UNPACK STRATEGY PERFORMANCE ---
+            if 'strategy_performance' in d and d['strategy_performance']:
+                try:
+                    strat_data = json.loads(d['strategy_performance'])
+                    # Flatten into PL_StrategyName format
+                    for k, v in strat_data.items():
+                        clean_row[f"PL_{k}"] = v
+                except:
+                    pass # Ignore JSON errors
+            
+            # --- TIMEZONE FIX ---
             if 'timestamp' in d:
                 try:
-                    # 1. Parse string to Pandas Timestamp
                     ts_pandas = pd.to_datetime(d['timestamp'])
-                    
-                    # 2. Convert to Python Native Datetime (Naive)
-                    # This ensures .timestamp() uses Local System Time (CET), matching live_monitor.py
                     ts_python = ts_pandas.to_pydatetime()
-                    
                     clean_row['time_unix'] = ts_python.timestamp()
-                    
-                    # Optional: Readable string
                     clean_row['time'] = ts_python.strftime('%H:%M:%S')
                 except Exception:
                     continue 
             
             equity_clean.append(clean_row)
         
-        # DB returns Newest->Oldest. Charts want Oldest->Newest.
         equity_clean.reverse()
         
         # Assign to History
@@ -64,7 +67,7 @@ if 'data_restored' not in st.session_state:
         st.session_state['session_full_history'] = equity_clean.copy()
         
         st.session_state['data_restored'] = True
-        print(f"Dashboard: Restored {len(equity_clean)} Snapshots (TZ Corrected)")
+        print(f"Dashboard: Restored {len(equity_clean)} Snapshots (Full Attribution)")
         
     except Exception as e:
         print(f"Dashboard Load Error: {e}")

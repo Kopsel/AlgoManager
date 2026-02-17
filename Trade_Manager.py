@@ -87,13 +87,8 @@ def connect_mt5():
     return True
 
 def sync_positions_on_startup():
-    """
-    Scans currently open positions in MT5.
-    If a position matches a strategy's Magic Number, we start tracking it.
-    """
     if not config: load_config()
     strategies = config.get('strategies', {})
-    
     magic_map = {v['magic_number']: k for k, v in strategies.items()}
     
     positions = mt5.positions_get()
@@ -107,7 +102,6 @@ def sync_positions_on_startup():
     
     print(f"Manager: Synced {count} existing positions.")
 
-
 def record_equity_snapshot():
     global last_snapshot_time
     if time.time() - last_snapshot_time < SNAPSHOT_INTERVAL:
@@ -119,17 +113,27 @@ def record_equity_snapshot():
     positions = mt5.positions_get()
     count = len(positions) if positions else 0
     
-    # Save to DB
-    db.log_equity_snapshot(acc.balance, acc.equity, count)
+    # --- CALCULATE STRATEGY BREAKDOWN ---
+    strategies = config.get('strategies', {})
+    magic_map = {v['magic_number']: k for k, v in strategies.items()}
+    
+    strat_pl = {k: 0.0 for k in strategies.keys()} # Default to 0.0 for all known strategies
+    
+    if positions:
+        for pos in positions:
+            # Map Magic Number -> Strategy ID
+            s_id = magic_map.get(pos.magic, "Manual/Other")
+            
+            # Accumulate Floating P/L (Profit + Swap)
+            current_val = strat_pl.get(s_id, 0.0)
+            strat_pl[s_id] = current_val + pos.profit + pos.swap
+            
+    # Save to DB (Passing strat_pl dict)
+    db.log_equity_snapshot(acc.balance, acc.equity, count, strat_pl)
     
     last_snapshot_time = time.time()
 
 def check_closed_trades():
-    """
-    Checks if any tracked tickets are missing from Open Positions.
-    If missing, queries history BY TICKET ID (Timezone proof).
-    Retries until history is found.
-    """
     live_positions = mt5.positions_get()
     if live_positions is None: return 
     live_ticket_ids = {p.ticket for p in live_positions}
@@ -246,7 +250,6 @@ def check_basket_logic():
         print("🔒 SYSTEM LOCKED: Daily Stop Loss Hit.")
 
 def execute_trade(signal_data):
-    # 1. Check Lock
     if system_locked: return "Manager: REJECTED (System Locked)"
 
     load_config()
@@ -270,7 +273,6 @@ def execute_trade(signal_data):
     limits = settings.get('trade_limits', {})
     sl_points = limits.get('sl_points', 0)
     
-    # 2. Dynamic TP Logic
     if 'dynamic_tp' in signal_data:
         tp_points = float(signal_data['dynamic_tp'])
     else:
@@ -308,7 +310,6 @@ def execute_trade(signal_data):
     if result.retcode != mt5.TRADE_RETCODE_DONE:
         return f"Manager: Failed ({result.comment})"
     
-    # --- 3. TRACKING & METADATA ---
     tracked_tickets[result.order] = strat_id
     
     if 'extra_metrics' in signal_data:
@@ -338,9 +339,7 @@ def run_manager():
 
     print(f"--- Manager Listening on Port {zmq_port} ---")
     
-    # Initialize DB (Creates tables if needed)
     db.initialize()
-    
     sync_positions_on_startup()
 
     while True:

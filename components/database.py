@@ -58,6 +58,38 @@ class Database:
         conn.commit()
         conn.close()
 
+    def get_todays_stats(self):
+        """
+        Calculates total trades and PnL for the current day from the DB.
+        This allows the dashboard to persist stats after a refresh.
+        """
+        conn = self.get_connection()
+        c = conn.cursor()
+        try:
+            # Get start of today (Midnight)
+            today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            today_str = today_start.strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Query: Total PnL and Trade Count for Today
+            # We filter by close_time >= today at 00:00:00
+            c.execute("""
+                SELECT COUNT(*), SUM(pnl) 
+                FROM trades 
+                WHERE close_time >= ?
+            """, (today_str,))
+            
+            row = c.fetchone()
+            count = row[0] if row[0] else 0
+            pnl = row[1] if row[1] else 0.0
+            
+            return {"daily_pnl": pnl, "trade_count": count}
+            
+        except Exception as e:
+            print(f"DB Read Error: {e}")
+            return {"daily_pnl": 0.0, "trade_count": 0}
+        finally:
+            conn.close()
+
     def log_trade(self, trade_dict):
         """
         Saves a trade to the DB.

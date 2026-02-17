@@ -8,12 +8,44 @@ from components.utils import load_config, init_mt5
 from components.live_monitor import render_live_panel
 from components.strategy_lab import render_strategy_lab
 from components.history import render_history_tab
-from components.journal import render_journal_tab  # <--- NEW COMPONENT
+from components.journal import render_journal_tab 
 from components.analytics import render_analytics_tab
+from components.database import Database  # <--- DB Import
 
 st.set_page_config(page_title="Algo Command", layout="wide")
 
-# --- SESSION STATE INITIALIZATION ---
+# --- 1. DATABASE STATE RESTORATION (The Persistence Layer) ---
+# This block runs once on startup/refresh to reload data from disk.
+if 'data_restored' not in st.session_state:
+    try:
+        db = Database()
+        
+        # A. Restore Daily Stats (PnL & Count)
+        stats = db.get_todays_stats()
+        st.session_state['daily_pnl'] = stats['daily_pnl']
+        st.session_state['daily_trades'] = stats['trade_count']
+        
+        # B. Restore Trade History (Last 50 trades for the Table)
+        # We populate 'history_data' so the History Tab isn't empty
+        recent_trades = db.fetch_trades(limit=50)
+        st.session_state['history_data'] = recent_trades
+        
+        # C. Restore Equity Curve (Last 500 snapshots for Analytics)
+        # We store this in a new session var for the Analytics component to use
+        equity_curve = db.fetch_equity_history(limit=500)
+        st.session_state['equity_history'] = equity_curve
+        
+        st.session_state['data_restored'] = True
+        print(f"Dashboard: Restored State (PnL: {stats['daily_pnl']} | Hist: {len(recent_trades)} | Eq: {len(equity_curve)})")
+        
+    except Exception as e:
+        print(f"Dashboard Load Error: {e}")
+        st.session_state['daily_pnl'] = 0.0
+        st.session_state['daily_trades'] = 0
+        st.session_state['history_data'] = []
+        st.session_state['equity_history'] = []
+
+# --- 2. SESSION STATE INITIALIZATION ---
 if 'history_data' not in st.session_state:
     st.session_state.history_data = []  
 if 'session_full_history' not in st.session_state:
@@ -26,7 +58,7 @@ if 'reset_ticket_threshold' not in st.session_state:
         path = config['system'].get('mt5_terminal_path')
         if init_mt5(path):
             now = datetime.now()
-            # Look back 7 days to find the very last ticket ID
+            # Look back 7 days to find the very last ticket ID to avoid re-alerting old trades
             recents = mt5.history_deals_get(now - timedelta(days=7), now + timedelta(days=1))
             if recents and len(recents) > 0:
                 st.session_state.reset_ticket_threshold = recents[-1].ticket
@@ -52,19 +84,26 @@ def main():
     with st.sidebar:
         st.header("Session Controls")
         if st.button("🔄 Reset Tracking Today", type="primary"):
+            # Clear Memory
             st.session_state.history_data = []
             st.session_state.session_full_history = []
+            st.session_state['equity_history'] = []
             
+            # Reset UI Metrics (DB remains intact, this just clears the view)
+            st.session_state['daily_pnl'] = 0.0
+            st.session_state['daily_trades'] = 0
+            
+            # Reset MT5 Ticket Threshold
             now = datetime.now()
             deals = mt5.history_deals_get(now - timedelta(days=7), now + timedelta(days=1))
             if deals and len(deals) > 0:
                 max_ticket = max(d.ticket for d in deals)
                 st.session_state.reset_ticket_threshold = max_ticket
             
-            st.success("Session Reset!")
+            st.success("Session View Reset!")
             st.rerun()
 
-    # --- CALCULATE METRICS (GLOBAL EXPOSURE) ---
+    # --- CALCULATE LIVE METRICS (GLOBAL EXPOSURE) ---
     acc = mt5.account_info()
     strategies = config.get('strategies', {})
     
@@ -87,10 +126,10 @@ def main():
     # Determine Direction String & Color
     if global_net_lots > 0:
         direction_str = "LONG 🐂"
-        delta_color = "normal" # Green (Positive delta)
+        delta_color = "normal" 
     elif global_net_lots < 0:
         direction_str = "SHORT 🐻"
-        delta_color = "inverse" # Red (Negative delta)
+        delta_color = "inverse" 
     else:
         direction_str = "FLAT ⚪"
         delta_color = "off"
@@ -103,16 +142,17 @@ def main():
         kpi1.metric("Balance", f"${acc.balance:,.2f}")
         kpi2.metric("Equity", f"${acc.equity:,.2f}", delta=f"{acc.equity - acc.balance:.2f}")
         
-        # 2. Strategy Count
-        active_count = sum(1 for s in strategies.values() if s['enabled'])
-        kpi3.metric("Active Bots", f"{active_count} / {len(strategies)}")
+        # 3. Daily PnL (Persisted)
+        daily_pnl = st.session_state.get('daily_pnl', 0.0)
+        daily_trades = st.session_state.get('daily_trades', 0)
+        kpi3.metric("Daily PnL", f"${daily_pnl:,.2f}", f"{daily_trades} Trades")
 
-        # 3. Risk / Exposure Stats
+        # 4. Risk / Exposure Stats
         kpi4.metric("Open Positions", f"{global_total_open}")
         kpi5.metric("Net Direction", direction_str, f"{global_net_lots:+.2f} Lots", delta_color=delta_color)
         kpi6.metric("Position Delta", f"{global_net_count:+}", help="Positive = More Buys, Negative = More Sells")
 
-    # --- TABS (Updated with Journal) ---
+    # --- TABS ---
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 Live Pulse", "⚙️ Strategy Lab", "📜 History", "🗄️ Journal", "📊 Analytics"])
 
     with tab1:
@@ -122,13 +162,15 @@ def main():
         render_strategy_lab(strategies, config)
 
     with tab3:
+        # Pass the persisted history data to the component
         render_history_tab(strategies)
         
     with tab4:
-        # [NEW] This renders the SQLite Table
+        # Journal reads directly from DB, so it works automatically
         render_journal_tab()
     
     with tab5:
+        # Ensure Analytics tab uses the session equity history if available
         render_analytics_tab()
 
     # Auto-Refresh Logic (Poll every 1s)

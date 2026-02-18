@@ -6,7 +6,7 @@ import pandas as pd
 import numpy as np
 import os
 import sys
-import traceback
+import gc # <--- NEW: For memory management
 from datetime import datetime, timedelta
 
 # --- IDENTITY ---
@@ -44,8 +44,14 @@ def calculate_volatility_tp(ticks_array, limits):
     lookback_ms = limits.get('volatility_lookback_sec', 60) * 1000
     current_msc = ticks_array[-1]['time_msc']
     cutoff_msc = current_msc - lookback_ms
-    recent_vol = ticks_array[ticks_array['time_msc'] >= cutoff_msc]
+    
+    # OPTIMIZED: Use SearchSorted here too
+    start_idx = np.searchsorted(ticks_array['time_msc'], cutoff_msc)
+    if start_idx >= len(ticks_array): return limits.get('tp_points', 1.0)
+    
+    recent_vol = ticks_array[start_idx:]
     if len(recent_vol) == 0: return limits.get('tp_points', 1.0)
+    
     high = np.max(recent_vol['ask'])
     low = np.min(recent_vol['ask'])
     multiplier = limits.get('tp_volatility_multiplier', 0.5)
@@ -72,14 +78,12 @@ def calibrate_time_specific_threshold(symbol, time_window_sec, lookback_days, pe
     deltas_series = pd.Series(deltas)
     return float(deltas_series.quantile(percentile))
 
-# --- INVENTORY SKEW LOGIC ---
 def get_inventory_skew(symbol, magic, lookback_minutes):
     positions = mt5.positions_get(symbol=symbol)
     if positions is None or len(positions) == 0:
         return 0, 0, 0
         
     cutoff_timestamp = (datetime.now() - timedelta(minutes=lookback_minutes)).timestamp()
-    
     recent_longs = 0
     recent_shorts = 0
     
@@ -127,7 +131,6 @@ def run_speed_engine():
     SKEW_LOOKBACK = DYN_CONF.get('lookback_minutes', 60)
     BASE_VOL = DYN_CONF.get('base_volume', my_conf['volume'])
     
-    # Gear Configurations
     GRIND_THR = DYN_CONF.get('grind_zone', {}).get('skew_threshold', 5)
     GRIND_WITH_TREND = DYN_CONF.get('grind_zone', {}).get('with_trend_volume', 0.08)
     GRIND_FADE_TREND = DYN_CONF.get('grind_zone', {}).get('fade_trend_volume', 0.02)
@@ -190,19 +193,21 @@ def run_speed_engine():
 
     try:
         while True:
+            # Recalibration Logic
             if USE_DYNAMIC_THRESHOLD and (time.time() - last_calibration_time > RECALIBRATE_INTERVAL_SEC):
                 new_threshold = calibrate_time_specific_threshold(SYMBOL, TIME_WINDOW_SEC, CALIB_DAYS, CALIB_PERCENTILE, CALIB_SLICE_MIN)
                 if new_threshold: FALLBACK_THRESHOLD = new_threshold
                 last_calibration_time = time.time()
+                # Force Garbage Collection after heavy calibration
+                gc.collect() 
 
-            # --- OPTIMIZATION 1: SERVER TIME & REDUCED FETCH WINDOW ---
+            # --- OPTIMIZATION: Reduced Fetch Window (15s is plenty for 2s calculation) ---
             server_tick = mt5.symbol_info_tick(SYMBOL)
             if server_tick is None:
                 time.sleep(1)
                 continue
             
             server_now = datetime.fromtimestamp(server_tick.time)
-            # Reduced from 90s to 15s to reduce CPU lag
             from_time = server_now - timedelta(seconds=15) 
             to_time = server_now + timedelta(seconds=10)
             
@@ -210,26 +215,23 @@ def run_speed_engine():
             
             if ticks is not None and len(ticks) > 1:
                 
-                # --- OPTIMIZATION 2: BATCH PROCESSING (The Spike Fix) ---
-                # We identify ALL ticks that are newer than what we processed last time
+                # Identify NEW ticks
+                # np.searchsorted is faster than boolean masking for finding where new data starts
+                # But boolean mask is fast enough here since we are slicing processing
                 new_ticks_mask = ticks['time_msc'] > last_processed_tick_msc
                 new_ticks = ticks[new_ticks_mask]
                 
-                # If no new ticks, skip
                 if len(new_ticks) == 0:
                     time.sleep(0.005)
                     continue
 
-                # Iterate through EVERY new tick to ensure we catch "Hidden Spikes"
+                # Batch Processing Loop
                 for i in range(len(new_ticks)):
                     current_tick = new_ticks[i]
                     current_msc = current_tick['time_msc']
-                    
-                    # Update global tracker
                     last_processed_tick_msc = current_msc
 
-                    # --- SLOW CHECKS (Run only on the latest tick of the batch to save CPU) ---
-                    # We don't need to recalculate RSI/Skew for every millisecond tick in a batch
+                    # --- SLOW CHECKS (Run only on the latest tick of batch) ---
                     if i == len(new_ticks) - 1:
                         if time.time() - last_slow_check > 2:
                             if USE_RSI:
@@ -265,22 +267,25 @@ def run_speed_engine():
                                     sell_vol = GRIND_WITH_TREND
 
                             last_slow_check = time.time()
+                            gc.collect() # Helper GC for long runs
 
-                    # --- FAST CHECKS (SPEED CALCULATION) ---
-                    # Calculate velocity for THIS specific tick in the batch
+                    # --- CRITICAL PERFORMANCE FIX: BINARY SEARCH ---
                     cutoff_msc = current_msc - (TIME_WINDOW_SEC * 1000)
                     
-                    # Filter history relevant to THIS tick's moment in time
-                    # We look at the history array, but capped at the current tick's time
-                    # This recreates the exact market state at that millisecond
+                    # OLD SLOW WAY: valid_ticks = ticks[(ticks['time_msc'] >= cutoff_msc) & ...]
+                    # NEW FAST WAY: Binary Search to find the exact index instantly
+                    start_idx = np.searchsorted(ticks['time_msc'], cutoff_msc)
                     
-                    # Optimization: Filter from the main 'ticks' array
-                    valid_history_mask = (ticks['time_msc'] >= cutoff_msc) & (ticks['time_msc'] <= current_msc)
-                    valid_ticks = ticks[valid_history_mask]
-                    
-                    if len(valid_ticks) > 1:
-                        tick_start = valid_ticks[0]
-                        tick_end = current_tick # The specific tick we are analyzing
+                    # Ensure index is within bounds
+                    if start_idx < len(ticks):
+                        tick_start = ticks[start_idx]
+                        tick_end = current_tick
+                        
+                        # Verify we are looking at the right time window (sanity check)
+                        # If the tick we found is TOO far in the future (gap in data), ignore.
+                        if tick_start['time_msc'] > current_msc:
+                            continue
+
                         delta = tick_end['ask'] - tick_start['ask']
                         
                         if USE_RSI:
@@ -293,7 +298,7 @@ def run_speed_engine():
                             
                         skew_txt = f"Skew:{skew:+d} (L:{recent_longs} S:{recent_shorts}) [{skew_state}]" if USE_DYN_SIZE else "Size: STATIC"
                         
-                        # Only print on the latest tick to avoid console spam, UNLESS we trigger
+                        # IO OPTIMIZATION: Only print on the very last tick of the batch
                         if i == len(new_ticks) - 1:
                             print(f"Thr:{FALLBACK_THRESHOLD:.3f} | Speed:{delta:+.3f} | {rsi_txt} | {skew_txt}       ", end='\r', flush=True)
 
@@ -309,13 +314,13 @@ def run_speed_engine():
                             
                             if target_vol <= 0.0:
                                 is_valid = False
-                                # Log blocked trades even if they are 'buried' in the batch
                                 ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
                                 print(f"\n[{ts}] 🛑 SIGNAL BLOCKED: {action} blocked by {skew_state} protective filter.", flush=True)
 
                             if is_valid:
                                 tp = calculate_volatility_tp(ticks, TRADE_LIMITS) if USE_VOL_TP else TP_POINTS
                                 signal_count += 1
+                                
                                 t_start_str = pd.to_datetime(tick_start['time_msc'], unit='ms').strftime('%H:%M:%S.%f')[:-3]
                                 t_end_str = pd.to_datetime(tick_end['time_msc'], unit='ms').strftime('%H:%M:%S.%f')[:-3]
                                 
@@ -351,7 +356,6 @@ def run_speed_engine():
                                     socket = connect_zmq()
                                 
                                 time.sleep(COOLDOWN_SEC)
-                                # Break the batch loop if we traded, to respect cooldown
                                 break 
 
             time.sleep(0.005)

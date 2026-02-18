@@ -12,18 +12,23 @@ def render_equity_chart(df_live, key=None):
         return
 
     # 1. Format Data for the Library
-    # The library expects a list of dicts: [{'time': 1234567890, 'value': 10500.50}, ...]
-    
     df_live = df_live.sort_values('time_unix')
     
     data_equity = []
     data_balance = []
     
     for _, row in df_live.iterrows():
-        # We use the unix timestamp for the x-axis
+        # Safety Check: If Time is missing, skip
+        if pd.isna(row['time_unix']): continue
+        
         t = int(row['time_unix']) 
-        data_equity.append({"time": t, "value": row['Equity']})
-        data_balance.append({"time": t, "value": row['Balance']})
+        
+        # --- FIX: Replace NaN with 0.0 to prevent JSON crash ---
+        eq_val = row['Equity'] if pd.notna(row['Equity']) else 0.0
+        bal_val = row['Balance'] if pd.notna(row['Balance']) else 0.0
+        
+        data_equity.append({"time": t, "value": eq_val})
+        data_balance.append({"time": t, "value": bal_val})
 
     # 2. Define Chart Options (Styling)
     chartOptions = {
@@ -72,7 +77,6 @@ def render_equity_chart(df_live, key=None):
     ]
 
     # 4. Render
-    # [FIX] We must pass a LIST containing a dict with "chart" and "series" keys.
     renderLightweightCharts([
         {
             "chart": chartOptions,
@@ -99,7 +103,14 @@ def render_drawdown_chart(df_live, key=None):
     for i, col in enumerate(pl_cols):
         data_series = []
         for _, row in df_live.iterrows():
-            data_series.append({"time": int(row['time_unix']), "value": row[col]})
+            if pd.isna(row['time_unix']): continue
+            
+            # --- FIX: Replace NaN with 0.0 to prevent JSON crash ---
+            val = row[col]
+            if pd.isna(val):
+                val = 0.0
+                
+            data_series.append({"time": int(row['time_unix']), "value": val})
         
         strat_name = col.replace("PL_", "")
         color = colors[i % len(colors)]
@@ -120,7 +131,6 @@ def render_drawdown_chart(df_live, key=None):
         "height": 300
     }
 
-    # [FIX] Wrap in the correct list structure
     renderLightweightCharts([
         {
             "chart": chartOptions,

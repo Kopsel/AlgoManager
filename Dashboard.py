@@ -16,25 +16,28 @@ from components.database import Database
 
 st.set_page_config(page_title="Algo Command", layout="wide")
 
+# --- CONFIGURATION ---
+# FIX: Offset hours to match Frankfurt (CET) if Server is UTC
+TIME_OFFSET = 1 
+
 # --- 1. DATABASE STATE RESTORATION ---
 if 'data_restored' not in st.session_state:
     try:
         db = Database()
         
-        # A. Restore Daily Stats (PnL & Count)
+        # A. Restore Daily Stats
         stats = db.get_todays_stats()
         st.session_state['daily_pnl'] = stats['daily_pnl']
         st.session_state['daily_trades'] = stats['trade_count']
         
-        # B. Restore Equity Curve (With Midnight Filter)
-        # Fetch plenty of data (2 days worth) to be safe
+        # B. Restore Equity Curve (With Timezone Fix)
         equity_raw = db.fetch_equity_history(limit=2880) 
         equity_clean = []
         
-        # Calculate Midnight Anchor
-        now = datetime.now()
-        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        midnight_timestamp = midnight.timestamp()
+        # Calculate Midnight relative to LOCAL time (not Server time)
+        now_local = datetime.now() + timedelta(hours=TIME_OFFSET)
+        midnight_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        midnight_timestamp = midnight_local.timestamp()
         
         for row in equity_raw:
             d = dict(row)
@@ -53,16 +56,17 @@ if 'data_restored' not in st.session_state:
                 except:
                     pass 
             
-            # Timezone & Midnight Logic
+            # Timezone Logic
             if 'timestamp' in d:
                 try:
                     ts_pandas = pd.to_datetime(d['timestamp'])
-                    ts_python = ts_pandas.to_pydatetime()
+                    # FIX: Shift DB timestamp to Local Time
+                    ts_python = ts_pandas.to_pydatetime() + timedelta(hours=TIME_OFFSET)
                     t_unix = ts_python.timestamp()
                     
-                    # --- THE FIX: FILTER OUT OLD DATA ---
+                    # Filter: Only show data from Local Midnight onwards
                     if t_unix < midnight_timestamp:
-                        continue # Skip data from yesterday
+                        continue 
                     
                     clean_row['time_unix'] = t_unix
                     clean_row['time'] = ts_python.strftime('%H:%M:%S')
@@ -71,17 +75,13 @@ if 'data_restored' not in st.session_state:
             
             equity_clean.append(clean_row)
         
-        # DB returns Newest->Oldest. Charts want Oldest->Newest.
         equity_clean.reverse()
         
-        # Full Session = Everything since Midnight
         st.session_state['session_full_history'] = equity_clean.copy()
-        
-        # Live View = Last 200 ticks (Zoomed in view)
         st.session_state['history_data'] = equity_clean[-200:] if len(equity_clean) > 200 else equity_clean.copy()
         
         st.session_state['data_restored'] = True
-        print(f"Dashboard: Restored {len(equity_clean)} Snapshots (Since Midnight)")
+        print(f"Dashboard: Restored {len(equity_clean)} Snapshots (Time Corrected)")
         
     except Exception as e:
         print(f"Dashboard Load Error: {e}")
@@ -96,17 +96,20 @@ if 'history_data' not in st.session_state:
 if 'session_full_history' not in st.session_state:
     st.session_state.session_full_history = [] 
 
-# --- 3. MT5 TICKET FILTER (Sync with Midnight) ---
+# --- 3. MT5 TICKET FILTER (Midnight Sync) ---
 if 'reset_ticket_threshold' not in st.session_state:
     config = load_config()
     if config:
         path = config['system'].get('mt5_terminal_path')
         if init_mt5(path):
-            now = datetime.now()
-            midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            # FIX: Calculate midnight based on Local Time
+            now_local = datetime.now() + timedelta(hours=TIME_OFFSET)
+            midnight_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
             
-            # Find the last ticket BEFORE midnight
-            history_before = mt5.history_deals_get(midnight - timedelta(days=7), midnight)
+            # Find the last ticket BEFORE local midnight
+            # Note: We pass this datetime to MT5. If Broker time != Local Time, this might need further tuning.
+            # Usually looking back from Local Midnight is safe.
+            history_before = mt5.history_deals_get(midnight_local - timedelta(days=7), midnight_local)
             
             if history_before and len(history_before) > 0:
                 st.session_state.reset_ticket_threshold = history_before[-1].ticket
@@ -118,7 +121,7 @@ if 'reset_ticket_threshold' not in st.session_state:
         st.session_state.reset_ticket_threshold = 0
 
 def main():
-    st.title("⚡ Algo Command (Midnight Session)")
+    st.title("⚡ Algo Command (Frankfurt Time)")
     
     config = load_config()
     if not config: return
@@ -138,14 +141,9 @@ def main():
             st.session_state['daily_pnl'] = 0.0
             st.session_state['daily_trades'] = 0
             
-            # Recalculate Threshold
-            now = datetime.now()
-            # If user resets manually, maybe they WANT to clear the day?
-            # Standard behavior: Reset view but respect today's history.
-            # If you want a 'hard clear', we set threshold to NOW.
-            # If you want 'reload', we set threshold to Midnight.
-            # Let's do 'Hard Clear' for manual reset button.
-            deals = mt5.history_deals_get(now - timedelta(days=7), now + timedelta(days=1))
+            # Hard Reset to NOW (Local)
+            now_local = datetime.now() + timedelta(hours=TIME_OFFSET)
+            deals = mt5.history_deals_get(now_local - timedelta(days=7), now_local + timedelta(days=1))
             if deals and len(deals) > 0:
                 st.session_state.reset_ticket_threshold = deals[-1].ticket
             

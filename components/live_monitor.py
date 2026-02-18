@@ -6,6 +6,7 @@ from components.charts import render_equity_chart, render_drawdown_chart
 from components.utils import get_strategy_name
 
 MAX_DATA_POINTS = 200
+TIME_OFFSET = 1 # FIX: +1 Hour for Frankfurt
 
 def render_live_panel(strategies, config):
     # --- DATA COLLECTION ---
@@ -28,7 +29,6 @@ def render_live_panel(strategies, config):
         for pos in positions:
             strat_name = get_strategy_name(pos.magic, strategies)
             
-            # Update Strategy Specific Data
             if strat_name in strat_live_data:
                 strat_live_data[strat_name]['floating'] += (pos.profit + pos.swap)
                 strat_live_data[strat_name]['open_lots'] += pos.volume
@@ -41,8 +41,9 @@ def render_live_panel(strategies, config):
                     strat_live_data[strat_name]['net_lots'] -= pos.volume
                     strat_live_data[strat_name]['net_count'] -= 1
 
-    # --- SAVE SNAPSHOT ---
-    now = datetime.now()
+    # --- SAVE SNAPSHOT (With Timezone Fix) ---
+    # We shift the "Now" time by +1 hour so it matches your local clock
+    now = datetime.now() + timedelta(hours=TIME_OFFSET)
     timestamp_str = now.strftime('%H:%M:%S')
     timestamp_unix = now.timestamp()
     
@@ -87,7 +88,6 @@ def render_live_panel(strategies, config):
     to_date = datetime.now() + timedelta(days=1)
     history = mt5.history_deals_get(from_date, to_date)
     
-    # Map Position ID -> Entry Magic Number
     position_magic_map = {}
     if history:
         for d in history:

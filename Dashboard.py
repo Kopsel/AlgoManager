@@ -26,9 +26,15 @@ if 'data_restored' not in st.session_state:
         st.session_state['daily_pnl'] = stats['daily_pnl']
         st.session_state['daily_trades'] = stats['trade_count']
         
-        # B. Restore Equity Curve
-        equity_raw = db.fetch_equity_history(limit=200) 
+        # B. Restore Equity Curve (With Midnight Filter)
+        # Fetch plenty of data (2 days worth) to be safe
+        equity_raw = db.fetch_equity_history(limit=2880) 
         equity_clean = []
+        
+        # Calculate Midnight Anchor
+        now = datetime.now()
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        midnight_timestamp = midnight.timestamp()
         
         for row in equity_raw:
             d = dict(row)
@@ -47,25 +53,35 @@ if 'data_restored' not in st.session_state:
                 except:
                     pass 
             
-            # Timezone Fix
+            # Timezone & Midnight Logic
             if 'timestamp' in d:
                 try:
                     ts_pandas = pd.to_datetime(d['timestamp'])
                     ts_python = ts_pandas.to_pydatetime()
-                    clean_row['time_unix'] = ts_python.timestamp()
+                    t_unix = ts_python.timestamp()
+                    
+                    # --- THE FIX: FILTER OUT OLD DATA ---
+                    if t_unix < midnight_timestamp:
+                        continue # Skip data from yesterday
+                    
+                    clean_row['time_unix'] = t_unix
                     clean_row['time'] = ts_python.strftime('%H:%M:%S')
                 except Exception:
                     continue 
             
             equity_clean.append(clean_row)
         
+        # DB returns Newest->Oldest. Charts want Oldest->Newest.
         equity_clean.reverse()
         
-        st.session_state['history_data'] = equity_clean
+        # Full Session = Everything since Midnight
         st.session_state['session_full_history'] = equity_clean.copy()
         
+        # Live View = Last 200 ticks (Zoomed in view)
+        st.session_state['history_data'] = equity_clean[-200:] if len(equity_clean) > 200 else equity_clean.copy()
+        
         st.session_state['data_restored'] = True
-        print(f"Dashboard: Restored {len(equity_clean)} Snapshots")
+        print(f"Dashboard: Restored {len(equity_clean)} Snapshots (Since Midnight)")
         
     except Exception as e:
         print(f"Dashboard Load Error: {e}")
@@ -80,25 +96,21 @@ if 'history_data' not in st.session_state:
 if 'session_full_history' not in st.session_state:
     st.session_state.session_full_history = [] 
 
-# --- CRITICAL FIX: Initialize Reset Threshold to MIDNIGHT ---
+# --- 3. MT5 TICKET FILTER (Sync with Midnight) ---
 if 'reset_ticket_threshold' not in st.session_state:
     config = load_config()
     if config:
         path = config['system'].get('mt5_terminal_path')
         if init_mt5(path):
-            # 1. Define Midnight (Start of current day)
             now = datetime.now()
             midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
             
-            # 2. Find the last ticket BEFORE midnight
-            # We fetch history ending exactly at midnight
+            # Find the last ticket BEFORE midnight
             history_before = mt5.history_deals_get(midnight - timedelta(days=7), midnight)
             
             if history_before and len(history_before) > 0:
-                # The threshold is the last trade of yesterday
                 st.session_state.reset_ticket_threshold = history_before[-1].ticket
             else:
-                # If no trades before midnight (fresh account), threshold is 0
                 st.session_state.reset_ticket_threshold = 0
         else:
             st.session_state.reset_ticket_threshold = 0
@@ -106,7 +118,7 @@ if 'reset_ticket_threshold' not in st.session_state:
         st.session_state.reset_ticket_threshold = 0
 
 def main():
-    st.title("⚡ Algo Trading Command Center v2.1")
+    st.title("⚡ Algo Command (Midnight Session)")
     
     config = load_config()
     if not config: return
@@ -126,12 +138,16 @@ def main():
             st.session_state['daily_pnl'] = 0.0
             st.session_state['daily_trades'] = 0
             
-            # Reset Threshold to CURRENT latest ticket (effectively clearing today's history from view)
+            # Recalculate Threshold
             now = datetime.now()
+            # If user resets manually, maybe they WANT to clear the day?
+            # Standard behavior: Reset view but respect today's history.
+            # If you want a 'hard clear', we set threshold to NOW.
+            # If you want 'reload', we set threshold to Midnight.
+            # Let's do 'Hard Clear' for manual reset button.
             deals = mt5.history_deals_get(now - timedelta(days=7), now + timedelta(days=1))
             if deals and len(deals) > 0:
-                max_ticket = max(d.ticket for d in deals)
-                st.session_state.reset_ticket_threshold = max_ticket
+                st.session_state.reset_ticket_threshold = deals[-1].ticket
             
             st.success("Session View Reset!")
             st.rerun()
@@ -156,7 +172,6 @@ def main():
                 global_net_lots -= pos.volume
                 global_net_count -= 1
 
-    # Determine Direction
     if global_net_lots > 0:
         direction_str = "LONG 🐂"
         delta_color = "normal" 
@@ -174,12 +189,10 @@ def main():
         kpi1.metric("Balance", f"${acc.balance:,.2f}")
         kpi2.metric("Equity", f"${acc.equity:,.2f}", delta=f"{acc.equity - acc.balance:.2f}")
         
-        # 3. Daily PnL (Persisted)
         daily_pnl = st.session_state.get('daily_pnl', 0.0)
         daily_trades = st.session_state.get('daily_trades', 0)
         kpi3.metric("Daily PnL", f"${daily_pnl:,.2f}", f"{daily_trades} Trades")
 
-        # 4. Risk / Exposure Stats
         kpi4.metric("Open Positions", f"{global_total_open}")
         kpi5.metric("Net Direction", direction_str, f"{global_net_lots:+.2f} Lots", delta_color=delta_color)
         kpi6.metric("Position Delta", f"{global_net_count:+}", help="Positive = More Buys, Negative = More Sells")

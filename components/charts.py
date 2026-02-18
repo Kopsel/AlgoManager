@@ -1,6 +1,17 @@
 import pandas as pd
 import streamlit as st
+import numpy as np
 from streamlit_lightweight_charts import renderLightweightCharts
+
+def safe_float(val):
+    """Ensures value is a valid float for JSON (no NaN or Inf)"""
+    try:
+        f_val = float(val)
+        if pd.isna(f_val) or np.isinf(f_val):
+            return 0.0
+        return f_val
+    except:
+        return 0.0
 
 def render_equity_chart(df_live, key=None):
     """
@@ -18,14 +29,13 @@ def render_equity_chart(df_live, key=None):
     data_balance = []
     
     for _, row in df_live.iterrows():
-        # Safety Check: If Time is missing, skip
         if pd.isna(row['time_unix']): continue
         
         t = int(row['time_unix']) 
         
-        # --- FIX: Replace NaN with 0.0 to prevent JSON crash ---
-        eq_val = row['Equity'] if pd.notna(row['Equity']) else 0.0
-        bal_val = row['Balance'] if pd.notna(row['Balance']) else 0.0
+        # FIX: Use safe_float helper
+        eq_val = safe_float(row.get('Equity'))
+        bal_val = safe_float(row.get('Balance'))
         
         data_equity.append({"time": t, "value": eq_val})
         data_balance.append({"time": t, "value": bal_val})
@@ -105,10 +115,8 @@ def render_drawdown_chart(df_live, key=None):
         for _, row in df_live.iterrows():
             if pd.isna(row['time_unix']): continue
             
-            # --- FIX: Replace NaN with 0.0 to prevent JSON crash ---
-            val = row[col]
-            if pd.isna(val):
-                val = 0.0
+            # FIX: Use safe_float helper to catch NaNs and Infs
+            val = safe_float(row.get(col))
                 
             data_series.append({"time": int(row['time_unix']), "value": val})
         

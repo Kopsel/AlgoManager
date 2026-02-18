@@ -54,8 +54,8 @@
         "sl_points": 0,
         "tp_points": 1.0,
         "use_volatility_based_tp": true,
-        "volatility_lookback_sec": 60,
-        "tp_volatility_multiplier": 0.5,
+        "volatility_lookback_sec": 160,
+        "tp_volatility_multiplier": 0.75,
         "min_tp_points": 0.5,
         "max_tp_points": 10.0
       }

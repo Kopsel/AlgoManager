@@ -72,7 +72,7 @@ def calibrate_time_specific_threshold(symbol, time_window_sec, lookback_days, pe
     deltas_series = pd.Series(deltas)
     return float(deltas_series.quantile(percentile))
 
-# --- NEW: INVENTORY SKEW LOGIC ---
+# --- INVENTORY SKEW LOGIC ---
 def get_inventory_skew(symbol, magic, lookback_minutes):
     positions = mt5.positions_get(symbol=symbol)
     if positions is None or len(positions) == 0:
@@ -90,7 +90,6 @@ def get_inventory_skew(symbol, magic, lookback_minutes):
             elif pos.type == mt5.ORDER_TYPE_SELL:
                 recent_shorts += 1
                 
-    # Skew: Positive = Net Long, Negative = Net Short
     skew = recent_longs - recent_shorts
     return skew, recent_longs, recent_shorts
 
@@ -196,140 +195,164 @@ def run_speed_engine():
                 if new_threshold: FALLBACK_THRESHOLD = new_threshold
                 last_calibration_time = time.time()
 
-            from_time = datetime.now() - timedelta(seconds=90)
-            ticks = mt5.copy_ticks_range(SYMBOL, from_time, datetime.now(), mt5.COPY_TICKS_ALL)
+            # --- OPTIMIZATION 1: SERVER TIME & REDUCED FETCH WINDOW ---
+            server_tick = mt5.symbol_info_tick(SYMBOL)
+            if server_tick is None:
+                time.sleep(1)
+                continue
             
-            if ticks is not None and len(ticks) > 10:
-                current_tick = ticks[-1]
-                current_msc = current_tick['time_msc']
+            server_now = datetime.fromtimestamp(server_tick.time)
+            # Reduced from 90s to 15s to reduce CPU lag
+            from_time = server_now - timedelta(seconds=15) 
+            to_time = server_now + timedelta(seconds=10)
+            
+            ticks = mt5.copy_ticks_range(SYMBOL, from_time, to_time, mt5.COPY_TICKS_ALL)
+            
+            if ticks is not None and len(ticks) > 1:
                 
-                if last_processed_tick_msc == current_msc:
-                    time.sleep(0.005) 
+                # --- OPTIMIZATION 2: BATCH PROCESSING (The Spike Fix) ---
+                # We identify ALL ticks that are newer than what we processed last time
+                new_ticks_mask = ticks['time_msc'] > last_processed_tick_msc
+                new_ticks = ticks[new_ticks_mask]
+                
+                # If no new ticks, skip
+                if len(new_ticks) == 0:
+                    time.sleep(0.005)
                     continue
-                last_processed_tick_msc = current_msc
-                
-                # --- SLOW CHECKS (RSI & INVENTORY SKEW) - Runs every 2 seconds ---
-                if time.time() - last_slow_check > 2:
+
+                # Iterate through EVERY new tick to ensure we catch "Hidden Spikes"
+                for i in range(len(new_ticks)):
+                    current_tick = new_ticks[i]
+                    current_msc = current_tick['time_msc']
                     
-                    # RSI Logic
-                    if USE_RSI:
-                        fetch_count = max(100, RSI_ANCHOR_MINUTES + 10)
-                        rates = mt5.copy_rates_from_pos(SYMBOL, SELECTED_TF, 0, fetch_count)
-                        if rates is not None and len(rates) > RSI_PERIOD:
-                            df_rates = pd.DataFrame(rates)
-                            rsi_series = calculate_rsi_series(df_rates['close'], RSI_PERIOD)
-                            current_rsi = rsi_series.iloc[-1]
-                            anchor_rsi = rsi_series.iloc[-min(len(rsi_series)-1, RSI_ANCHOR_MINUTES)]
-                    
-                    # Inventory Skew Sizing Logic
-                    if USE_DYN_SIZE:
-                        skew, recent_longs, recent_shorts = get_inventory_skew(SYMBOL, MAGIC, SKEW_LOOKBACK)
-                        
-                        # Reset Defaults
-                        buy_vol = BASE_VOL
-                        sell_vol = BASE_VOL
-                        skew_state = "CHOP (Balanced)"
-                        
-                        # 1. Negative Skew = Net Shorts stuck -> Market Grinding UP 📈
-                        if skew <= -RUNAWAY_THR:
-                            skew_state = "RUNAWAY UP"
-                            buy_vol = RUNAWAY_WITH_TREND
-                            sell_vol = RUNAWAY_FADE_TREND
-                        elif skew <= -GRIND_THR:
-                            skew_state = "GRIND UP"
-                            buy_vol = GRIND_WITH_TREND
-                            sell_vol = GRIND_FADE_TREND
+                    # Update global tracker
+                    last_processed_tick_msc = current_msc
+
+                    # --- SLOW CHECKS (Run only on the latest tick of the batch to save CPU) ---
+                    # We don't need to recalculate RSI/Skew for every millisecond tick in a batch
+                    if i == len(new_ticks) - 1:
+                        if time.time() - last_slow_check > 2:
+                            if USE_RSI:
+                                fetch_count = max(100, RSI_ANCHOR_MINUTES + 10)
+                                rates = mt5.copy_rates_from_pos(SYMBOL, SELECTED_TF, 0, fetch_count)
+                                if rates is not None and len(rates) > RSI_PERIOD:
+                                    df_rates = pd.DataFrame(rates)
+                                    rsi_series = calculate_rsi_series(df_rates['close'], RSI_PERIOD)
+                                    current_rsi = rsi_series.iloc[-1]
+                                    anchor_rsi = rsi_series.iloc[-min(len(rsi_series)-1, RSI_ANCHOR_MINUTES)]
                             
-                        # 2. Positive Skew = Net Longs stuck -> Market Grinding DOWN 📉
-                        elif skew >= RUNAWAY_THR:
-                            skew_state = "RUNAWAY DOWN"
-                            buy_vol = RUNAWAY_FADE_TREND
-                            sell_vol = RUNAWAY_WITH_TREND
-                        elif skew >= GRIND_THR:
-                            skew_state = "GRIND DOWN"
-                            buy_vol = GRIND_FADE_TREND
-                            sell_vol = GRIND_WITH_TREND
+                            if USE_DYN_SIZE:
+                                skew, recent_longs, recent_shorts = get_inventory_skew(SYMBOL, MAGIC, SKEW_LOOKBACK)
+                                buy_vol = BASE_VOL
+                                sell_vol = BASE_VOL
+                                skew_state = "CHOP (Balanced)"
+                                
+                                if skew <= -RUNAWAY_THR:
+                                    skew_state = "RUNAWAY UP"
+                                    buy_vol = RUNAWAY_WITH_TREND
+                                    sell_vol = RUNAWAY_FADE_TREND
+                                elif skew <= -GRIND_THR:
+                                    skew_state = "GRIND UP"
+                                    buy_vol = GRIND_WITH_TREND
+                                    sell_vol = GRIND_FADE_TREND
+                                elif skew >= RUNAWAY_THR:
+                                    skew_state = "RUNAWAY DOWN"
+                                    buy_vol = RUNAWAY_FADE_TREND
+                                    sell_vol = RUNAWAY_WITH_TREND
+                                elif skew >= GRIND_THR:
+                                    skew_state = "GRIND DOWN"
+                                    buy_vol = GRIND_FADE_TREND
+                                    sell_vol = GRIND_WITH_TREND
 
-                    last_slow_check = time.time()
+                            last_slow_check = time.time()
 
-                # --- FAST CHECKS (SPEED CALCULATION) ---
-                cutoff_msc = current_msc - (TIME_WINDOW_SEC * 1000)
-                valid_ticks = ticks[ticks['time_msc'] >= cutoff_msc]
-                
-                if len(valid_ticks) > 1:
-                    tick_start = valid_ticks[0]
-                    tick_end = valid_ticks[-1]
-                    delta = tick_end['ask'] - tick_start['ask']
+                    # --- FAST CHECKS (SPEED CALCULATION) ---
+                    # Calculate velocity for THIS specific tick in the batch
+                    cutoff_msc = current_msc - (TIME_WINDOW_SEC * 1000)
                     
-                    if USE_RSI:
-                        bias = "NEUTRAL (Block)"
-                        if anchor_rsi > RSI_UPPER: bias = "HOT (Allow Sell)"
-                        elif anchor_rsi < RSI_LOWER: bias = "COLD (Allow Buy)"
-                        rsi_txt = f"Curr:{current_rsi:.1f} | Past(-{RSI_ANCHOR_MINUTES}m):{anchor_rsi:.1f} [{bias}]"
-                    else:
-                        rsi_txt = "OFF"
-                        
-                    skew_txt = f"Skew:{skew:+d} (L:{recent_longs} S:{recent_shorts}) [{skew_state}]" if USE_DYN_SIZE else "Size: STATIC"
-                    print(f"Thr:{FALLBACK_THRESHOLD:.3f} | Speed:{delta:+.3f} | {rsi_txt} | {skew_txt}       ", end='\r', flush=True)
-
-                    if abs(delta) > FALLBACK_THRESHOLD:
-                        action = "SELL" if delta > 0 else "BUY"
-                        is_valid = True 
+                    # Filter history relevant to THIS tick's moment in time
+                    # We look at the history array, but capped at the current tick's time
+                    # This recreates the exact market state at that millisecond
+                    
+                    # Optimization: Filter from the main 'ticks' array
+                    valid_history_mask = (ticks['time_msc'] >= cutoff_msc) & (ticks['time_msc'] <= current_msc)
+                    valid_ticks = ticks[valid_history_mask]
+                    
+                    if len(valid_ticks) > 1:
+                        tick_start = valid_ticks[0]
+                        tick_end = current_tick # The specific tick we are analyzing
+                        delta = tick_end['ask'] - tick_start['ask']
                         
                         if USE_RSI:
-                            if action == "SELL" and anchor_rsi <= RSI_UPPER: is_valid = False
-                            elif action == "BUY" and anchor_rsi >= RSI_LOWER: is_valid = False
-
-                        # Apply Dynamic Volume
-                        target_vol = buy_vol if action == "BUY" else sell_vol
+                            bias = "NEUTRAL (Block)"
+                            if anchor_rsi > RSI_UPPER: bias = "HOT (Allow Sell)"
+                            elif anchor_rsi < RSI_LOWER: bias = "COLD (Allow Buy)"
+                            rsi_txt = f"Curr:{current_rsi:.1f} | Past(-{RSI_ANCHOR_MINUTES}m):{anchor_rsi:.1f} [{bias}]"
+                        else:
+                            rsi_txt = "OFF"
+                            
+                        skew_txt = f"Skew:{skew:+d} (L:{recent_longs} S:{recent_shorts}) [{skew_state}]" if USE_DYN_SIZE else "Size: STATIC"
                         
-                        # Block trades if sizing logic sets volume to 0 (Runaway filter)
-                        if target_vol <= 0.0:
-                            is_valid = False
-                            ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                            print(f"\n[{ts}] 🛑 SIGNAL BLOCKED: {action} blocked by {skew_state} protective filter.", flush=True)
+                        # Only print on the latest tick to avoid console spam, UNLESS we trigger
+                        if i == len(new_ticks) - 1:
+                            print(f"Thr:{FALLBACK_THRESHOLD:.3f} | Speed:{delta:+.3f} | {rsi_txt} | {skew_txt}       ", end='\r', flush=True)
 
-                        if is_valid:
-                            tp = calculate_volatility_tp(ticks, TRADE_LIMITS) if USE_VOL_TP else TP_POINTS
-                            signal_count += 1
+                        if abs(delta) > FALLBACK_THRESHOLD:
+                            action = "SELL" if delta > 0 else "BUY"
+                            is_valid = True 
                             
-                            t_start_str = pd.to_datetime(tick_start['time_msc'], unit='ms').strftime('%H:%M:%S.%f')[:-3]
-                            t_end_str = pd.to_datetime(tick_end['time_msc'], unit='ms').strftime('%H:%M:%S.%f')[:-3]
-                            
-                            # --- THE AUDIT RECEIPT ---
-                            print("\n\n" + "="*55)
-                            print("🚨 SIGNAL AUDIT RECEIPT 🚨")
-                            print(f"Action:      {action} (Signal #{signal_count})")
-                            print(f"Time Window: {TIME_WINDOW_SEC} Seconds")
-                            print(f"Start Price: {tick_start['ask']:.3f} (at {t_start_str})")
-                            print(f"End Price:   {tick_end['ask']:.3f} (at {t_end_str})")
-                            print(f"Math:        {tick_end['ask']:.3f} - {tick_start['ask']:.3f} = {delta:+.3f}")
-                            print(f"Threshold:   {FALLBACK_THRESHOLD:.3f} (Valid: {abs(delta):.3f} > {FALLBACK_THRESHOLD:.3f})")
                             if USE_RSI:
-                                print(f"Anchor RSI:  {anchor_rsi:.1f} (Allowed: {'<' if action=='BUY' else '>'} {RSI_LOWER if action=='BUY' else RSI_UPPER})")
-                            if USE_DYN_SIZE:
-                                print(f"Skew State:  {skew_state}")
-                                print(f"Recent Skew: {skew:+d} (Stranded L: {recent_longs} | S: {recent_shorts})")
-                            print(f"Volume:      {target_vol:.2f} lots")
-                            print(f"Dynamic TP:  {tp:.2f} points")
-                            print("="*55 + "\n", flush=True)
+                                if action == "SELL" and anchor_rsi <= RSI_UPPER: is_valid = False
+                                elif action == "BUY" and anchor_rsi >= RSI_LOWER: is_valid = False
+
+                            target_vol = buy_vol if action == "BUY" else sell_vol
                             
-                            # Send dynamic volume to Trade Manager
-                            payload = {
-                                "strategy_id": MY_STRATEGY_ID, "symbol": SYMBOL, "action": action, 
-                                "dynamic_tp": tp, "volume": target_vol,
-                                "extra_metrics": {"rsi": current_rsi, "speed": delta, "magic": MAGIC, "skew": skew}
-                            }
-                            
-                            try:
-                                socket.send_json(payload)
-                                print(f"        Manager: {socket.recv_string()}", flush=True)
-                            except (zmq.Again, zmq.ZMQError):
-                                print(f"        ⚠️ Comms Error. Resetting...", flush=True)
-                                socket.close()
-                                socket = connect_zmq()
-                            
-                            time.sleep(COOLDOWN_SEC)
+                            if target_vol <= 0.0:
+                                is_valid = False
+                                # Log blocked trades even if they are 'buried' in the batch
+                                ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                                print(f"\n[{ts}] 🛑 SIGNAL BLOCKED: {action} blocked by {skew_state} protective filter.", flush=True)
+
+                            if is_valid:
+                                tp = calculate_volatility_tp(ticks, TRADE_LIMITS) if USE_VOL_TP else TP_POINTS
+                                signal_count += 1
+                                t_start_str = pd.to_datetime(tick_start['time_msc'], unit='ms').strftime('%H:%M:%S.%f')[:-3]
+                                t_end_str = pd.to_datetime(tick_end['time_msc'], unit='ms').strftime('%H:%M:%S.%f')[:-3]
+                                
+                                print("\n\n" + "="*55)
+                                print("🚨 SIGNAL AUDIT RECEIPT 🚨")
+                                print(f"Action:      {action} (Signal #{signal_count})")
+                                print(f"Time Window: {TIME_WINDOW_SEC} Seconds")
+                                print(f"Start Price: {tick_start['ask']:.3f} (at {t_start_str})")
+                                print(f"End Price:   {tick_end['ask']:.3f} (at {t_end_str})")
+                                print(f"Math:        {tick_end['ask']:.3f} - {tick_start['ask']:.3f} = {delta:+.3f}")
+                                print(f"Threshold:   {FALLBACK_THRESHOLD:.3f} (Valid: {abs(delta):.3f} > {FALLBACK_THRESHOLD:.3f})")
+                                if USE_RSI:
+                                    print(f"Anchor RSI:  {anchor_rsi:.1f} (Allowed: {'<' if action=='BUY' else '>'} {RSI_LOWER if action=='BUY' else RSI_UPPER})")
+                                if USE_DYN_SIZE:
+                                    print(f"Skew State:  {skew_state}")
+                                    print(f"Recent Skew: {skew:+d} (Stranded L: {recent_longs} | S: {recent_shorts})")
+                                print(f"Volume:      {target_vol:.2f} lots")
+                                print(f"Dynamic TP:  {tp:.2f} points")
+                                print("="*55 + "\n", flush=True)
+                                
+                                payload = {
+                                    "strategy_id": MY_STRATEGY_ID, "symbol": SYMBOL, "action": action, 
+                                    "dynamic_tp": tp, "volume": target_vol,
+                                    "extra_metrics": {"rsi": current_rsi, "speed": delta, "magic": MAGIC, "skew": skew}
+                                }
+                                
+                                try:
+                                    socket.send_json(payload)
+                                    print(f"        Manager: {socket.recv_string()}", flush=True)
+                                except (zmq.Again, zmq.ZMQError):
+                                    print(f"        ⚠️ Comms Error. Resetting...", flush=True)
+                                    socket.close()
+                                    socket = connect_zmq()
+                                
+                                time.sleep(COOLDOWN_SEC)
+                                # Break the batch loop if we traded, to respect cooldown
+                                break 
 
             time.sleep(0.005)
 

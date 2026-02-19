@@ -169,7 +169,7 @@ def run_speed_engine():
                 time.sleep(3)
         if not calib_success: print(" Failed (Timeout). Using Fallback.")
 
-    zmq_host, sys_conf['zmq_host']
+    zmq_host = sys_conf['zmq_host']
     zmq_port = sys_conf['zmq_port']
     context = zmq.Context()
     

@@ -6,7 +6,7 @@ import pandas as pd
 import numpy as np
 import os
 import sys
-import gc # <--- NEW: For memory management
+import gc 
 from datetime import datetime, timedelta
 
 # --- IDENTITY ---
@@ -45,7 +45,6 @@ def calculate_volatility_tp(ticks_array, limits):
     current_msc = ticks_array[-1]['time_msc']
     cutoff_msc = current_msc - lookback_ms
     
-    # OPTIMIZED: Use SearchSorted here too
     start_idx = np.searchsorted(ticks_array['time_msc'], cutoff_msc)
     if start_idx >= len(ticks_array): return limits.get('tp_points', 1.0)
     
@@ -83,11 +82,20 @@ def get_inventory_skew(symbol, magic, lookback_minutes):
     if positions is None or len(positions) == 0:
         return 0, 0, 0
         
-    cutoff_timestamp = (datetime.now() - timedelta(minutes=lookback_minutes)).timestamp()
+    # --- THE FIX: Use MT5 Server Time exclusively ---
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None: 
+        return 0, 0, 0
+        
+    current_server_time = tick.time
+    # Substract minutes converted to seconds
+    cutoff_timestamp = current_server_time - (lookback_minutes * 60)
+    
     recent_longs = 0
     recent_shorts = 0
     
     for pos in positions:
+        # Now comparing Server Time with Server Time
         if pos.magic == magic and pos.time >= cutoff_timestamp:
             if pos.type == mt5.ORDER_TYPE_BUY:
                 recent_longs += 1
@@ -161,7 +169,8 @@ def run_speed_engine():
                 time.sleep(3)
         if not calib_success: print(" Failed (Timeout). Using Fallback.")
 
-    zmq_host, zmq_port = sys_conf['zmq_host'], sys_conf['zmq_port']
+    zmq_host, sys_conf['zmq_host']
+    zmq_port = sys_conf['zmq_port']
     context = zmq.Context()
     
     def connect_zmq():
@@ -198,10 +207,8 @@ def run_speed_engine():
                 new_threshold = calibrate_time_specific_threshold(SYMBOL, TIME_WINDOW_SEC, CALIB_DAYS, CALIB_PERCENTILE, CALIB_SLICE_MIN)
                 if new_threshold: FALLBACK_THRESHOLD = new_threshold
                 last_calibration_time = time.time()
-                # Force Garbage Collection after heavy calibration
                 gc.collect() 
 
-            # --- OPTIMIZATION: Reduced Fetch Window (15s is plenty for 2s calculation) ---
             server_tick = mt5.symbol_info_tick(SYMBOL)
             if server_tick is None:
                 time.sleep(1)
@@ -215,9 +222,6 @@ def run_speed_engine():
             
             if ticks is not None and len(ticks) > 1:
                 
-                # Identify NEW ticks
-                # np.searchsorted is faster than boolean masking for finding where new data starts
-                # But boolean mask is fast enough here since we are slicing processing
                 new_ticks_mask = ticks['time_msc'] > last_processed_tick_msc
                 new_ticks = ticks[new_ticks_mask]
                 
@@ -225,13 +229,12 @@ def run_speed_engine():
                     time.sleep(0.005)
                     continue
 
-                # Batch Processing Loop
                 for i in range(len(new_ticks)):
                     current_tick = new_ticks[i]
                     current_msc = current_tick['time_msc']
                     last_processed_tick_msc = current_msc
 
-                    # --- SLOW CHECKS (Run only on the latest tick of batch) ---
+                    # --- SLOW CHECKS ---
                     if i == len(new_ticks) - 1:
                         if time.time() - last_slow_check > 2:
                             if USE_RSI:
@@ -267,22 +270,16 @@ def run_speed_engine():
                                     sell_vol = GRIND_WITH_TREND
 
                             last_slow_check = time.time()
-                            gc.collect() # Helper GC for long runs
+                            gc.collect() 
 
-                    # --- CRITICAL PERFORMANCE FIX: BINARY SEARCH ---
+                    # --- FAST CHECKS ---
                     cutoff_msc = current_msc - (TIME_WINDOW_SEC * 1000)
-                    
-                    # OLD SLOW WAY: valid_ticks = ticks[(ticks['time_msc'] >= cutoff_msc) & ...]
-                    # NEW FAST WAY: Binary Search to find the exact index instantly
                     start_idx = np.searchsorted(ticks['time_msc'], cutoff_msc)
                     
-                    # Ensure index is within bounds
                     if start_idx < len(ticks):
                         tick_start = ticks[start_idx]
                         tick_end = current_tick
                         
-                        # Verify we are looking at the right time window (sanity check)
-                        # If the tick we found is TOO far in the future (gap in data), ignore.
                         if tick_start['time_msc'] > current_msc:
                             continue
 
@@ -298,7 +295,6 @@ def run_speed_engine():
                             
                         skew_txt = f"Skew:{skew:+d} (L:{recent_longs} S:{recent_shorts}) [{skew_state}]" if USE_DYN_SIZE else "Size: STATIC"
                         
-                        # IO OPTIMIZATION: Only print on the very last tick of the batch
                         if i == len(new_ticks) - 1:
                             print(f"Thr:{FALLBACK_THRESHOLD:.3f} | Speed:{delta:+.3f} | {rsi_txt} | {skew_txt}       ", end='\r', flush=True)
 

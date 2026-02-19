@@ -30,9 +30,9 @@
         "rsi_rolling_window_minutes": 60,
         "calibration": {
           "lookback_days": 10,
-          "percentile": 0.95,
+          "percentile": 0.97,
           "recalibrate_minutes": 2,
-          "time_slice_minutes": 30
+          "time_slice_minutes": 10
         },
         "dynamic_sizing": {
           "enabled": true,

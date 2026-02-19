@@ -57,10 +57,16 @@ def calculate_volatility_tp(ticks_array, limits):
     return float(max(limits.get('min_tp_points', 0.5), min((high - low) * multiplier, limits.get('max_tp_points', 5.0))))
 
 def calibrate_time_specific_threshold(symbol, time_window_sec, lookback_days, percentile, time_slice_minutes):
-    now = datetime.now()
+    # --- THE FIX: Anchor calibration to Server Time, NOT PC Time ---
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        return None
+        
+    server_now = datetime.fromtimestamp(tick.time)
     deltas = []
+    
     for i in range(lookback_days):
-        target_time = now - timedelta(days=i)
+        target_time = server_now - timedelta(days=i)
         slice_start = target_time - timedelta(minutes=time_slice_minutes)
         slice_end = target_time + timedelta(minutes=time_slice_minutes)
         ticks = mt5.copy_ticks_range(symbol, slice_start, slice_end, mt5.COPY_TICKS_ALL)
@@ -82,20 +88,17 @@ def get_inventory_skew(symbol, magic, lookback_minutes):
     if positions is None or len(positions) == 0:
         return 0, 0, 0
         
-    # --- THE FIX: Use MT5 Server Time exclusively ---
     tick = mt5.symbol_info_tick(symbol)
     if tick is None: 
         return 0, 0, 0
         
     current_server_time = tick.time
-    # Substract minutes converted to seconds
     cutoff_timestamp = current_server_time - (lookback_minutes * 60)
     
     recent_longs = 0
     recent_shorts = 0
     
     for pos in positions:
-        # Now comparing Server Time with Server Time
         if pos.magic == magic and pos.time >= cutoff_timestamp:
             if pos.type == mt5.ORDER_TYPE_BUY:
                 recent_longs += 1

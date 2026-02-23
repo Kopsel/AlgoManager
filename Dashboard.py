@@ -170,14 +170,18 @@ def main():
                 global_net_lots -= pos.volume
                 global_net_count -= 1
 
+    # --- NEW: EXPOSURE DISPLAY LOGIC ---
     if global_net_lots > 0:
-        direction_str = "LONG 🐂"
+        exposure_val = f"{global_net_lots:+.2f} Lots"
+        exposure_tag = "LONG 🐂" # Green tag automatically
         delta_color = "normal" 
     elif global_net_lots < 0:
-        direction_str = "SHORT 🐻"
-        delta_color = "inverse" 
+        exposure_val = f"{global_net_lots:+.2f} Lots"
+        exposure_tag = "-SHORT 🐻" # Minus forces Streamlit to make it Red
+        delta_color = "normal" 
     else:
-        direction_str = "FLAT ⚪"
+        exposure_val = "0.00 Lots"
+        exposure_tag = "FLAT ⚪"
         delta_color = "off"
 
     # --- TOP METRICS ROW ---
@@ -192,7 +196,10 @@ def main():
         kpi3.metric("Daily PnL", f"${daily_pnl:,.2f}", f"{daily_trades} Trades")
 
         kpi4.metric("Open Positions", f"{global_total_open}")
-        kpi5.metric("Net Direction", direction_str, f"{global_net_lots:+.2f} Lots", delta_color=delta_color)
+        
+        # Swapped the label and tag here
+        kpi5.metric("Net Exposure", exposure_val, exposure_tag, delta_color=delta_color)
+        
         kpi6.metric("Position Delta", f"{global_net_count:+}", help="Positive = More Buys, Negative = More Sells")
 
     # --- TABS ---

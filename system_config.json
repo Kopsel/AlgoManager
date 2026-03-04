@@ -22,6 +22,13 @@
         "cooldown_sec": 5,
         "use_dynamic_threshold": true,
         "fallback_threshold": 0.5,
+        "spacing_filter": {
+          "enabled": true,
+          "mode": "dynamic", 
+          "fixed_points": 1.5,
+          "atr_period": 14,
+          "atr_multiplier": 0.35
+        },
         "efficiency_filter": {
           "enabled": true,
           "lookback_minutes": 15,

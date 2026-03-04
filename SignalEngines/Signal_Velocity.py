@@ -29,14 +29,22 @@ def load_config():
         data = json.load(f)
         return data['strategies'][MY_STRATEGY_ID], data['system']
 
-# --- NEW: KAUFMAN EFFICIENCY RATIO ---
+# --- NEW: FAST ATR CALCULATION ---
+def calculate_atr(df_rates, period=14):
+    if len(df_rates) < period + 1: return 1.0 
+    high_low = df_rates['high'] - df_rates['low']
+    high_close = np.abs(df_rates['high'] - df_rates['close'].shift())
+    low_close = np.abs(df_rates['low'] - df_rates['close'].shift())
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = np.max(ranges, axis=1)
+    atr = true_range.rolling(window=period).mean().iloc[-1]
+    return float(atr)
+
+# --- KAUFMAN EFFICIENCY RATIO ---
 def calculate_efficiency_ratio(df_rates):
     if len(df_rates) < 2: return 0.0, 0.0
-    # Net Direction: Absolute difference between first and last close
     net_direction = df_rates['close'].iloc[-1] - df_rates['close'].iloc[0]
-    # Total Path Length: Sum of all absolute 1-minute close-to-close movements
     path_length = df_rates['close'].diff().abs().sum()
-    
     er = abs(net_direction) / path_length if path_length > 0 else 0.0
     return er, net_direction
 
@@ -59,11 +67,9 @@ def calculate_volatility_tp(ticks_array, limits):
 
 def calibrate_time_specific_threshold(symbol, time_window_sec, lookback_days, short_lookback_days, percentile, time_slice_minutes):
     tick = mt5.symbol_info_tick(symbol)
-    if tick is None:
-        return None
+    if tick is None: return None
         
     server_now = datetime.fromtimestamp(tick.time)
-    
     deltas_long = []
     deltas_short = []
     
@@ -101,8 +107,7 @@ def get_inventory_skew(symbol, magic, lookback_minutes):
         return 0, 0, 0
         
     tick = mt5.symbol_info_tick(symbol)
-    if tick is None: 
-        return 0, 0, 0
+    if tick is None: return 0, 0, 0
         
     current_server_time = tick.time
     cutoff_timestamp = current_server_time - (lookback_minutes * 60)
@@ -140,11 +145,17 @@ def run_speed_engine():
     CALIB_INTERVAL_MIN = CALIB_CONF.get('recalibrate_minutes', 2) 
     CALIB_SLICE_MIN = CALIB_CONF.get('time_slice_minutes', 30)
     
-    # --- EFFICIENCY CONFIG ---
     EFF_CONF = PARAMS.get('efficiency_filter', {})
     USE_EFFICIENCY = EFF_CONF.get('enabled', False)
     EFF_LOOKBACK_MIN = EFF_CONF.get('lookback_minutes', 15)
     EFF_THRESHOLD = EFF_CONF.get('threshold', 0.35)
+
+    # --- SPACING CONFIG ---
+    SPACE_CONF = PARAMS.get('spacing_filter', {})
+    USE_SPACING = SPACE_CONF.get('enabled', False)
+    SPACE_MODE = SPACE_CONF.get('mode', 'dynamic')
+    SPACE_ATR_PERIOD = SPACE_CONF.get('atr_period', 14)
+    SPACE_ATR_MULT = SPACE_CONF.get('atr_multiplier', 0.35)
     
     DYN_CONF = PARAMS.get('dynamic_sizing', {})
     USE_DYN_SIZE = DYN_CONF.get('enabled', False)
@@ -190,13 +201,13 @@ def run_speed_engine():
     def connect_zmq():
         s = context.socket(zmq.REQ)
         s.connect(f"tcp://{zmq_host}:{zmq_port}")
-        s.setsockopt(zmq.RCVTIMEO, 5000) # FIXED: 5000ms ensures no timeout on US Open
+        s.setsockopt(zmq.RCVTIMEO, 5000)
         s.setsockopt(zmq.LINGER, 0)
         return s
 
     socket = connect_zmq()
     print(f"✓ ZMQ connected. Strategy: {MY_STRATEGY_ID}")
-    print(f"✓ EFFICIENCY FILTER: {'ON' if USE_EFFICIENCY else 'OFF'} | DYNAMIC SIZING: {'ON' if USE_DYN_SIZE else 'OFF'}")
+    print(f"✓ FILTERS -> EFF: {'ON' if USE_EFFICIENCY else 'OFF'} | SPACING: {'DYNAMIC' if SPACE_MODE == 'dynamic' else 'FIXED'} | DYN SIZE: {'ON' if USE_DYN_SIZE else 'OFF'}")
 
     last_processed_tick_msc = 0
     last_slow_check = 0
@@ -206,6 +217,9 @@ def run_speed_engine():
     current_er = 0.0
     macro_direction = 0.0
     er_regime = "CHOP/RANGE"
+    
+    current_atr = 1.0
+    required_spacing = SPACE_CONF.get('fixed_points', 1.5)
     
     skew = 0
     recent_longs = 0
@@ -253,17 +267,24 @@ def run_speed_engine():
                     if i == len(new_ticks) - 1:
                         if time.time() - last_slow_check > 2:
                             
-                            # Calculate ER
-                            if USE_EFFICIENCY:
-                                rates = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_M1, 0, EFF_LOOKBACK_MIN)
+                            if USE_EFFICIENCY or (USE_SPACING and SPACE_MODE == "dynamic"):
+                                fetch_bars = max(EFF_LOOKBACK_MIN, SPACE_ATR_PERIOD + 1)
+                                rates = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_M1, 0, fetch_bars)
+                                
                                 if rates is not None and len(rates) > 2:
                                     df_rates = pd.DataFrame(rates)
-                                    current_er, macro_direction = calculate_efficiency_ratio(df_rates)
                                     
-                                    if current_er >= EFF_THRESHOLD:
-                                        er_regime = "TREND UP (Block Shorts)" if macro_direction > 0 else "TREND DOWN (Block Buys)"
-                                    else:
-                                        er_regime = "CHOP/RANGE (Allow Both)"
+                                    if USE_EFFICIENCY:
+                                        er_df = df_rates.tail(EFF_LOOKBACK_MIN)
+                                        current_er, macro_direction = calculate_efficiency_ratio(er_df)
+                                        if current_er >= EFF_THRESHOLD:
+                                            er_regime = "TREND UP (Block Shorts)" if macro_direction > 0 else "TREND DOWN (Block Buys)"
+                                        else:
+                                            er_regime = "CHOP/RANGE (Allow Both)"
+                                            
+                                    if USE_SPACING and SPACE_MODE == "dynamic":
+                                        current_atr = calculate_atr(df_rates, period=SPACE_ATR_PERIOD)
+                                        required_spacing = current_atr * SPACE_ATR_MULT
                             
                             if USE_DYN_SIZE:
                                 skew, recent_longs, recent_shorts = get_inventory_skew(SYMBOL, MAGIC, SKEW_LOOKBACK)
@@ -299,27 +320,23 @@ def run_speed_engine():
                         tick_start = ticks[start_idx]
                         tick_end = current_tick
                         
-                        if tick_start['time_msc'] > current_msc:
-                            continue
+                        if tick_start['time_msc'] > current_msc: continue
 
                         delta = tick_end['ask'] - tick_start['ask']
                         
-                        if USE_EFFICIENCY:
-                            er_txt = f"ER:{current_er:.2f} [{er_regime}]"
-                        else:
-                            er_txt = "EFF: OFF"
-                            
+                        er_txt = f"ER:{current_er:.2f} [{er_regime}]" if USE_EFFICIENCY else "EFF: OFF"
+                        space_txt = f"Spc:{required_spacing:.2f}p" if USE_SPACING else "Spc: OFF"
                         skew_txt = f"Skew:{skew:+d} [{skew_state}]" if USE_DYN_SIZE else "Size: STATIC"
                         
                         if i == len(new_ticks) - 1:
-                            print(f"Thr:{FALLBACK_THRESHOLD:.3f} | Vel:{delta:+.3f} | {er_txt} | {skew_txt}       ", end='\r', flush=True)
+                            print(f"Thr:{FALLBACK_THRESHOLD:.3f} | Vel:{delta:+.3f} | {er_txt} | {space_txt} | {skew_txt}       ", end='\r', flush=True)
 
                         if abs(delta) > FALLBACK_THRESHOLD:
                             action = "SELL" if delta > 0 else "BUY"
                             is_valid = True 
                             block_reason = ""
                             
-                            # --- APPLY ER FILTER ---
+                            # --- 1. APPLY ER FILTER ---
                             if USE_EFFICIENCY and current_er >= EFF_THRESHOLD:
                                 if action == "SELL" and macro_direction > 0:
                                     is_valid = False
@@ -327,6 +344,21 @@ def run_speed_engine():
                                 elif action == "BUY" and macro_direction < 0:
                                     is_valid = False
                                     block_reason = "Blocked by Downward Trend (ER)"
+
+                            # --- 2. APPLY SPACING FILTER ---
+                            if is_valid and USE_SPACING:
+                                open_positions = mt5.positions_get(symbol=SYMBOL)
+                                if open_positions:
+                                    target_type = mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL
+                                    exec_price = tick_end['ask'] if action == "BUY" else tick_end['bid']
+                                    
+                                    for p in open_positions:
+                                        if p.magic == MAGIC and p.type == target_type:
+                                            distance = abs(exec_price - p.price_open)
+                                            if distance < required_spacing:
+                                                is_valid = False
+                                                block_reason = f"Blocked by Spacing Filter (Dist {distance:.2f} < Req {required_spacing:.2f})"
+                                                break
 
                             target_vol = buy_vol if action == "BUY" else sell_vol
                             
@@ -376,6 +408,8 @@ def run_speed_engine():
                                 print(f"Threshold:   {FALLBACK_THRESHOLD:.3f} (Valid: {abs(delta):.3f} > {FALLBACK_THRESHOLD:.3f})")
                                 if USE_EFFICIENCY:
                                     print(f"Path Efficiency: {current_er:.2f} (Regime: {er_regime})")
+                                if USE_SPACING:
+                                    print(f"Spacing Filter: Passed (Req Dist: {required_spacing:.2f} pts)")
                                 if USE_DYN_SIZE:
                                     print(f"Skew State:  {skew_state}")
                                     print(f"Recent Skew: {skew:+d} (Stranded L: {recent_longs} | S: {recent_shorts})")

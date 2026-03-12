@@ -6,9 +6,8 @@
     "authorized_account_number": 427273
   },
   "risk_management": {
-    "basket_enabled": false,
-    "basket_take_profit_usd": 100000.0,
-    "basket_stop_loss_usd": -100000.0
+    "basket_enabled": true,
+    "basket_take_profit_usd": 0.1
   },
   "strategies": {
     "SPEED_US500_01": {

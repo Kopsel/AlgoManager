@@ -21,6 +21,7 @@ SNAPSHOT_INTERVAL = 60
 tracked_tickets = {} # Maps Ticket -> Strategy ID
 trade_metadata = {}  # Maps Ticket -> {Speed, RSI, etc.}
 system_locked = False 
+basket_start_equity = None # NEW: The Equity Watermark Anchor
 
 # Initialize Database
 db = Database()
@@ -219,7 +220,7 @@ def close_all_positions(reason="Global Basket Trigger"):
         mt5.order_send(request)
 
 def check_basket_logic():
-    global system_locked
+    global system_locked, basket_start_equity
     
     if system_locked: return
 
@@ -227,27 +228,32 @@ def check_basket_logic():
     risk = config.get('risk_management', {})
     
     if not risk.get('basket_enabled', False):
+        basket_start_equity = None # Reset anchor if user turns off basket mode mid-flight
         return
 
-    positions = mt5.positions_get()
-    if positions is None or len(positions) == 0:
-        return
+    acc = mt5.account_info()
+    if acc is None: return
 
-    current_profit = sum([pos.profit + pos.swap for pos in positions])
-    
+    current_equity = acc.equity
+
+    # Set the Anchor Point (Watermark) if it doesn't exist yet
+    if basket_start_equity is None:
+        basket_start_equity = current_equity
+        print(f"Manager: 🎯 Basket Tracking Started. Anchor Equity: ${basket_start_equity:.2f}")
+
+    # Grab target from config
     tp_limit = risk.get('basket_take_profit_usd')
-    if tp_limit and current_profit >= tp_limit:
-        print(f"!!! BASKET TP HIT (${current_profit:.2f}) !!!")
-        close_all_positions(reason="Basket Take Profit")
-        system_locked = True
-        print("🔒 SYSTEM LOCKED: Daily Target Reached.")
 
-    sl_limit = risk.get('basket_stop_loss_usd')
-    if sl_limit and current_profit <= sl_limit:
-        print(f"!!! BASKET SL HIT (${current_profit:.2f}) !!!")
-        close_all_positions(reason="Basket Stop Loss")
-        system_locked = True
-        print("🔒 SYSTEM LOCKED: Daily Stop Loss Hit.")
+    # Check Take Profit
+    if tp_limit and tp_limit > 0:
+        target_amount = basket_start_equity + tp_limit
+        if current_equity >= target_amount:
+            print(f"\n!!! BASKET TP HIT (Equity: ${current_equity:.2f} >= Target: ${target_amount:.2f}) !!!")
+            close_all_positions(reason="Equity Target Reached")
+            
+            # Reset the anchor to None. It will grab the fresh post-close equity on the next loop!
+            basket_start_equity = None
+            print("🔄 BASKET RESET: Waiting for trades to clear before setting new anchor...\n")
 
 def execute_trade(signal_data):
     if system_locked: return "Manager: REJECTED (System Locked)"

@@ -35,7 +35,7 @@
           "threshold": 0.35
         },
         "calibration": {
-          "lookback_days": 20,
+          "lookback_days": 14,
           "short_lookback_days": 3,
           "percentile": 0.96,
           "recalibrate_minutes": 2,

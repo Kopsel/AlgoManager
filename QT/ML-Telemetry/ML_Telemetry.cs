@@ -61,7 +61,7 @@ namespace ML_Telemetry
 
         public ML_Telemetry() : base()
         {
-            this.Name = "ML_Telemetry_Dynamic";
+            this.Name = "ML_Telemetry";
             this.Description = "L2 Bot with Adaptive Volatility & True Velocity";
         }
 

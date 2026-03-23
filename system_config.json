@@ -2,7 +2,7 @@
   "system": {
     "zmq_host": "localhost",
     "zmq_port": 5555,
-    "mt5_terminal_path": "E:\\FusionMarketsMT5\\terminal64.exe",
+    "mt5_terminal_path": "C:\\Program Files\\MetaTrader 5\\terminal64.exe",
     "authorized_account_number": 427273
   },
   "risk_management": {

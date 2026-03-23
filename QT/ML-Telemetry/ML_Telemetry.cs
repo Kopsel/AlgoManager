@@ -25,6 +25,10 @@ namespace ML_Telemetry
         [InputParameter("Time Window (ms)", 30)]
         public int TimeWindowMs = 2000;
 
+        // NEW: Cooldown replaces the .Clear() command
+        [InputParameter("Cooldown (ms)", 32)]
+        public int CooldownMs = 5000;
+
         [InputParameter("VWAP Reset Hour (UTC)", 35)]
         public int VwapResetHourUtc = 22;
 
@@ -43,10 +47,11 @@ namespace ML_Telemetry
         private bool _isZmqConnected = false;
         private object _lockObject = new object();
 
-        // VWAP Variables
+        // VWAP & Cooldown Variables
         private double _cumulativePriceVolume = 0;
         private double _cumulativeVolume = 0;
         private DateTime _lastVwapReset = DateTime.MinValue;
+        private DateTime _lastTriggerTime = DateTime.MinValue;
 
         public ML_Telemetry() : base()
         {
@@ -74,6 +79,9 @@ namespace ML_Telemetry
 
             this.symbol.NewLast += SymbolOnNewLast;
 
+            // FIX: This line MUST exist, otherwise Quantower stops updating the DOM!
+            this.symbol.NewLevel2 += SymbolOnNewLevel2;
+
             Task.Run(() =>
             {
                 try
@@ -95,6 +103,7 @@ namespace ML_Telemetry
             if (this.symbol != null)
             {
                 this.symbol.NewLast -= SymbolOnNewLast;
+                this.symbol.NewLevel2 -= SymbolOnNewLevel2;
             }
 
             _isZmqConnected = false;
@@ -207,8 +216,10 @@ namespace ML_Telemetry
                         ? (last.Time - _fiveMinHistory.Peek().Time).TotalMinutes
                         : 0;
 
-                    // WARMUP LOCK
-                    if (Math.Abs(speedDelta) >= SpeedThreshold && minutesStored >= 4.9)
+                    bool cooldownOver = (DateTime.Now - _lastTriggerTime).TotalMilliseconds > CooldownMs;
+
+                    // WARMUP & COOLDOWN LOCK
+                    if (Math.Abs(speedDelta) >= SpeedThreshold && minutesStored >= 4.9 && cooldownOver)
                     {
                         int tickCount = _tickHistory.Count;
                         double volumeInWindow = _tickHistory.Sum(t => t.Size);
@@ -247,14 +258,13 @@ namespace ML_Telemetry
 
                         TriggerMLSnapshot(speedDelta, tickCount, volumeInWindow, absorptionRatio, vwapDistPct, pa5mOpenNorm, pa5mHighNorm, pa5mLowNorm, pa5mRange, sma1m, sma5m, trendDist, activityTicks, currentImbalance, imbalanceAgo, imbalanceShift, dom);
 
-                        _tickHistory.Clear();
-                        _tickImbalanceHistory.Clear();
+                        _lastTriggerTime = DateTime.Now;
+                        // FIX: Notice that .Clear() is GONE! We keep the history rolling.
                     }
                 }
             }
         }
 
-        // FIX: Replaced non-existent Interface with concrete class 'DepthOfMarketAggregatedCollections'
         private void TriggerMLSnapshot(double speedDelta, int tickCount, double volWindow, double absorption, double vwapDistPct, double openNorm, double highNorm, double lowNorm, double range, double sma1m, double sma5m, double trendDist, int activityTicks, double currentImb, double agoImb, double shiftImb, DepthOfMarketAggregatedCollections domData)
         {
             if (!_isZmqConnected) return;
@@ -324,5 +334,8 @@ namespace ML_Telemetry
                 Log($"Snapshot Error: {ex.Message}", StrategyLoggingLevel.Error);
             }
         }
+
+        // Empty handler to force Quantower to keep the Level 2 buffer alive
+        private void SymbolOnNewLevel2(Symbol currentSymbol, Level2Quote level2, DOMQuote dom) { }
     }
 }

@@ -19,13 +19,15 @@ namespace ML_Telemetry
         [InputParameter("Symbol", 10)]
         public Symbol symbol;
 
-        [InputParameter("Speed Threshold (Points)", 20)]
-        public double SpeedThreshold = 2.0;
+        [InputParameter("Vol Multiplier (% of 5m Range)", 20)]
+        public double VolMultiplier = 0.30;
+
+        [InputParameter("Minimum Spike Floor (Pts)", 21)]
+        public double MinSpikeFloor = 1.0;
 
         [InputParameter("Time Window (ms)", 30)]
         public int TimeWindowMs = 2000;
 
-        // NEW: Cooldown replaces the .Clear() command
         [InputParameter("Cooldown (ms)", 32)]
         public int CooldownMs = 5000;
 
@@ -47,16 +49,20 @@ namespace ML_Telemetry
         private bool _isZmqConnected = false;
         private object _lockObject = new object();
 
-        // VWAP & Cooldown Variables
+        // VWAP & Trigger Variables
         private double _cumulativePriceVolume = 0;
         private double _cumulativeVolume = 0;
         private DateTime _lastVwapReset = DateTime.MinValue;
         private DateTime _lastTriggerTime = DateTime.MinValue;
 
+        // Dynamic Threshold tracking
+        private int _lastCalcSecond = -1;
+        private double _dynamicSpeedThreshold = 2.0;
+
         public ML_Telemetry() : base()
         {
-            this.Name = "ML_Telemetry";
-            this.Description = "L2 Bot with Regime & Order Book Imbalance Shift";
+            this.Name = "ML_Telemetry_Dynamic";
+            this.Description = "L2 Bot with Adaptive Volatility & True Velocity";
         }
 
         protected override void OnCreated()
@@ -78,9 +84,7 @@ namespace ML_Telemetry
             PrimeVwapData();
 
             this.symbol.NewLast += SymbolOnNewLast;
-
-            // FIX: This line MUST exist, otherwise Quantower stops updating the DOM!
-            this.symbol.NewLevel2 += SymbolOnNewLevel2;
+            this.symbol.NewLevel2 += SymbolOnNewLevel2; // MUST exist to keep DOM alive
 
             Task.Run(() =>
             {
@@ -145,7 +149,6 @@ namespace ML_Telemetry
                 }
 
                 _lastVwapReset = startTime;
-                double initialVwap = _cumulativeVolume > 0 ? (_cumulativePriceVolume / _cumulativeVolume) : this.symbol.Last;
                 Log($"✅ VWAP Primed! Started tracking from {startTime:HH:mm} UTC.", StrategyLoggingLevel.Trading);
             }
             catch (Exception ex)
@@ -168,7 +171,6 @@ namespace ML_Telemetry
 
                 _cumulativeVolume += last.Size;
                 _cumulativePriceVolume += (last.Price * last.Size);
-
                 double currentVwap = _cumulativeVolume > 0 ? (_cumulativePriceVolume / _cumulativeVolume) : last.Price;
 
                 // 2. 1-MINUTE OHLC QUEUE
@@ -212,14 +214,28 @@ namespace ML_Telemetry
                     var oldestSpeedTick = _tickHistory.Peek();
                     double speedDelta = Math.Round(last.Price - oldestSpeedTick.Price, 2);
 
-                    double minutesStored = _fiveMinHistory.Count > 0
-                        ? (last.Time - _fiveMinHistory.Peek().Time).TotalMinutes
-                        : 0;
+                    // --- NEW: TRUE VELOCITY MATH ---
+                    double actualTimeMs = (last.Time - oldestSpeedTick.Time).TotalMilliseconds;
+                    if (actualTimeMs == 0) actualTimeMs = 1; // Prevent div by zero
+                    double pointsPerSecond = Math.Round(speedDelta / (actualTimeMs / 1000.0), 2);
+
+                    double minutesStored = _fiveMinHistory.Count > 0 ? (last.Time - _fiveMinHistory.Peek().Time).TotalMinutes : 0;
+
+                    // --- DYNAMIC THRESHOLD MATH (1Hz CPU Throttle) ---
+                    if (minutesStored >= 4.9 && last.Time.Second != _lastCalcSecond)
+                    {
+                        double pa5mHigh = _fiveMinHistory.Max(t => t.Price);
+                        double pa5mLow = _fiveMinHistory.Min(t => t.Price);
+                        double range5m = pa5mHigh - pa5mLow;
+
+                        _dynamicSpeedThreshold = Math.Max(MinSpikeFloor, Math.Round(range5m * VolMultiplier, 2));
+                        _lastCalcSecond = last.Time.Second;
+                    }
 
                     bool cooldownOver = (DateTime.Now - _lastTriggerTime).TotalMilliseconds > CooldownMs;
 
-                    // WARMUP & COOLDOWN LOCK
-                    if (Math.Abs(speedDelta) >= SpeedThreshold && minutesStored >= 4.9 && cooldownOver)
+                    // --- ADAPTIVE TRIGGER ---
+                    if (Math.Abs(speedDelta) >= _dynamicSpeedThreshold && minutesStored >= 4.9 && cooldownOver)
                     {
                         int tickCount = _tickHistory.Count;
                         double volumeInWindow = _tickHistory.Sum(t => t.Size);
@@ -244,28 +260,25 @@ namespace ML_Telemetry
                             }
                         }
 
-                        // REGIME MATH
                         double sma1m = _oneMinHistory.Count > 0 ? Math.Round(_oneMinHistory.Average(t => t.Price), 2) : last.Price;
                         double sma5m = _fiveMinHistory.Count > 0 ? Math.Round(_fiveMinHistory.Average(t => t.Price), 2) : last.Price;
                         double trendDist = Math.Round(sma1m - sma5m, 2);
                         int activityTicks = _fiveMinHistory.Count;
 
-                        // IMBALANCE SHIFT MATH
                         double imbalanceAgo = _tickImbalanceHistory.Peek();
                         double imbalanceShift = Math.Round(currentImbalance - imbalanceAgo, 2);
 
-                        Log($"🚨 SPIKE: {speedDelta:F2} pts! Shift: {imbalanceShift}% | Trend: {trendDist} pts", StrategyLoggingLevel.Trading);
+                        Log($"🚨 SPIKE: {speedDelta:F2} pts at {pointsPerSecond:F2} pts/sec | Threshold: {_dynamicSpeedThreshold:F2} | Shift: {imbalanceShift}%", StrategyLoggingLevel.Trading);
 
-                        TriggerMLSnapshot(speedDelta, tickCount, volumeInWindow, absorptionRatio, vwapDistPct, pa5mOpenNorm, pa5mHighNorm, pa5mLowNorm, pa5mRange, sma1m, sma5m, trendDist, activityTicks, currentImbalance, imbalanceAgo, imbalanceShift, dom);
+                        TriggerMLSnapshot(speedDelta, pointsPerSecond, actualTimeMs, tickCount, volumeInWindow, absorptionRatio, vwapDistPct, pa5mOpenNorm, pa5mHighNorm, pa5mLowNorm, pa5mRange, sma1m, sma5m, trendDist, activityTicks, currentImbalance, imbalanceAgo, imbalanceShift, dom);
 
                         _lastTriggerTime = DateTime.Now;
-                        // FIX: Notice that .Clear() is GONE! We keep the history rolling.
                     }
                 }
             }
         }
 
-        private void TriggerMLSnapshot(double speedDelta, int tickCount, double volWindow, double absorption, double vwapDistPct, double openNorm, double highNorm, double lowNorm, double range, double sma1m, double sma5m, double trendDist, int activityTicks, double currentImb, double agoImb, double shiftImb, DepthOfMarketAggregatedCollections domData)
+        private void TriggerMLSnapshot(double speedDelta, double pointsPerSec, double actualTimeMs, int tickCount, double volWindow, double absorption, double vwapDistPct, double openNorm, double highNorm, double lowNorm, double range, double sma1m, double sma5m, double trendDist, int activityTicks, double currentImb, double agoImb, double shiftImb, DepthOfMarketAggregatedCollections domData)
         {
             if (!_isZmqConnected) return;
 
@@ -283,6 +296,8 @@ namespace ML_Telemetry
                     trigger = new
                     {
                         speed_delta = speedDelta,
+                        points_per_second = pointsPerSec,
+                        actual_time_ms = actualTimeMs,
                         time_window_ms = TimeWindowMs,
                         tick_count = tickCount,
                         total_volume = volWindow,
@@ -335,7 +350,6 @@ namespace ML_Telemetry
             }
         }
 
-        // Empty handler to force Quantower to keep the Level 2 buffer alive
         private void SymbolOnNewLevel2(Symbol currentSymbol, Level2Quote level2, DOMQuote dom) { }
     }
 }

@@ -14,20 +14,33 @@ from components.database import Database
 # --- CONFIG & AI MODEL ---
 CONFIG_FILE = os.path.join(BASE_DIR, "system_config.json")
 config = {}
+last_config_mtime = 0
 ai_model = None
 
-def load_config():
-    global config, ai_model
-    with open(CONFIG_FILE, "r") as f:
-        config = json.load(f)
+def get_file_mtime(filepath):
+    if os.path.exists(filepath): return os.path.getmtime(filepath)
+    return 0
+
+def load_config_and_model():
+    global config, last_config_mtime, ai_model
+    
+    current_mtime = get_file_mtime(CONFIG_FILE)
+    if current_mtime > last_config_mtime:
+        with open(CONFIG_FILE, "r") as f:
+            config = json.load(f)
+            
+        last_config_mtime = current_mtime
+        print("🔄 ML Brain: Configuration Reloaded.")
         
-    model_path = os.path.join(BASE_DIR, config.get('ml_pipeline', {}).get('alpha_filter', {}).get('model_save_path', ''))
-    if os.path.exists(model_path):
-        ai_model = xgb.XGBClassifier()
-        ai_model.load_model(model_path)
-        print(f"🧠 AI Alpha Filter Loaded from {model_path}")
-    else:
-        print("⚠️ Warning: AI Model not found. Filtering will be disabled.")
+        # Only load the AI model once at startup
+        if ai_model is None:
+            model_path = os.path.join(BASE_DIR, config.get('ml_pipeline', {}).get('alpha_filter', {}).get('model_save_path', ''))
+            if os.path.exists(model_path):
+                ai_model = xgb.XGBClassifier()
+                ai_model.load_model(model_path)
+                print(f"🧠 AI Alpha Filter Loaded from {model_path}")
+            else:
+                print("⚠️ Warning: AI Model not found. Filtering will be disabled.")
 
 def calculate_dynamic_size(confidence):
     ml_settings = config['ml_pipeline']['alpha_filter']['dynamic_sizing']
@@ -36,7 +49,14 @@ def calculate_dynamic_size(confidence):
         
     min_conf = ml_settings['min_confidence_threshold']
     min_vol = ml_settings['min_volume']
-    max_vol = ml_settings['max_volume']
+    
+    # --- UPGRADE: SUPERVISOR TOGGLE LOGIC ---
+    supervisor_present = ml_settings.get('supervisor_present', False)
+    if supervisor_present:
+        max_vol = ml_settings.get('max_volume_supervised', 0.5)
+    else:
+        max_vol = ml_settings.get('max_volume_unsupervised', 0.1)
+        
     power = ml_settings.get('curve_power', 2.0)
     
     if confidence < min_conf:
@@ -47,6 +67,7 @@ def calculate_dynamic_size(confidence):
     volume = min_vol + (top_heavy_scale * (max_vol - min_vol))
     return float(round(volume, 2))
 
+# ... [Keep process_qt_velocity and process_qt_trend exactly the same] ...
 def process_qt_velocity(payload):
     trigger = payload.get('trigger', {})
     
@@ -71,6 +92,16 @@ def process_qt_velocity(payload):
     for i, b in enumerate(bids): dom_features[f'bid_norm_{i}'] = b / total_liq
     for i, a in enumerate(asks): dom_features[f'ask_norm_{i}'] = a / total_liq
 
+    regime = context_data.get('macro_regime_state', 1) 
+    regime_blocked = False
+    
+    if regime == 0 and action == "SELL":
+        regime_blocked = True
+        print("🔭 WATCHTOWER: Regime 0 (Longs Only) -> Blocked counter-trend SELL")
+    elif regime == 2 and action == "BUY":
+        regime_blocked = True
+        print("🔭 WATCHTOWER: Regime 2 (Shorts Only) -> Blocked counter-trend BUY")
+
     feature_dict = {
         **trigger, **context_data, 
         'hour': temporal['hour'], 'day_of_week': temporal['day_of_week'], 'is_buy': is_buy,
@@ -86,22 +117,25 @@ def process_qt_velocity(payload):
     win_confidence = probabilities[0][1]
     
     volume = calculate_dynamic_size(win_confidence)
-    blocked = volume == 0.0
+    ai_blocked = volume == 0.0
+    
+    final_blocked = ai_blocked or regime_blocked
     
     custom_metrics = {
         "confidence": float(win_confidence),
         "speed": trigger.get('speed_delta', 0),
-        "absorption": trigger.get('absorption_ratio', 0)
+        "absorption": trigger.get('absorption_ratio', 0),
+        "macro_regime": int(regime)
     }
     
-    return action, custom_metrics, volume, blocked
+    return action, custom_metrics, volume, final_blocked
 
 def process_qt_trend(payload):
     return "BUY", {}, None, False
 
 def run_ml_brain():
-    print("🧠 Starting ML Router Brain (HFT Optimized)...")
-    load_config()
+    print("🧠 Starting ML Router Brain (HFT & Stacking Optimized)...")
+    load_config_and_model() # Initial load
     db = Database()
     context = zmq.Context()
     
@@ -115,6 +149,9 @@ def run_ml_brain():
 
     try:
         while True:
+            # --- UPGRADE: HOT RELOAD CHECK ---
+            load_config_and_model() 
+            
             message = receiver_socket.recv_string()
             receiver_socket.send_string("ACK") 
             
@@ -124,22 +161,21 @@ def run_ml_brain():
             timestamp = payload.get('timestamp', 0)
             
             if strategy_id == "QT_Velocity":
-                action, custom_metrics, volume, blocked = process_qt_velocity(payload)
+                action, custom_metrics, volume, final_blocked = process_qt_velocity(payload)
             elif strategy_id == "QT_Trend":
-                action, custom_metrics, volume, blocked = process_qt_trend(payload)
+                action, custom_metrics, volume, final_blocked = process_qt_trend(payload)
             else:
                 continue
 
             volume = round(float(volume), 2) if volume is not None else 0.0
 
-            # --- INJECT AI VERDICT INTO PAYLOAD FOR RECORD KEEPING ---
             payload['ai_decision'] = {
                 "confidence": custom_metrics.get("confidence", 0),
-                "blocked": blocked,
+                "blocked": final_blocked,
                 "volume": volume
             }
 
-            if blocked:
+            if final_blocked:
                 print(f"🚫 BLOCKED by AI | Confidence: {payload['ai_decision']['confidence']*100:.1f}%")
                 ml_id = int(time.time() * 1000000)
                 db.insert_ml_snapshot(strategy_id, symbol, timestamp, payload, explicit_id=ml_id)

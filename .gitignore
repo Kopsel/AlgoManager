@@ -3,6 +3,9 @@
 trading_system.db
 *.sqlite3
 
+*.jpg
+*.png
+
 # Ignore Logs and temporary outputs
 *.log
 /logs

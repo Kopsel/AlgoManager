@@ -20,6 +20,36 @@ st.set_page_config(page_title="Algo Command", layout="wide")
 # FIX: Offset hours to match Frankfurt (CET) if Server is UTC
 TIME_OFFSET = 1 
 
+def update_supervisor_mode(new_state):
+    config_path = 'system_config.json' # Ensure this matches your actual path
+    try:
+        with open(config_path, 'r') as f:
+            cfg = json.load(f)
+            
+        sizing_ref = cfg['ml_pipeline']['alpha_filter']['dynamic_sizing']
+        
+        # Automatically upgrade the JSON structure if it's still using the old format
+        if 'supervisor_present' not in sizing_ref:
+            sizing_ref['max_volume_supervised'] = 0.5
+            sizing_ref['max_volume_unsupervised'] = 0.1
+            
+        sizing_ref['supervisor_present'] = new_state
+        
+        with open(config_path, 'w') as f:
+            json.dump(cfg, f, indent=2)
+            
+        return True
+    except Exception as e:
+        st.sidebar.error(f"Failed to update config: {e}")
+        return False
+
+def on_supervisor_toggle():
+    # Grab the exact state of the toggle directly from Streamlit's memory
+    new_state = st.session_state.supervisor_switch
+    if update_supervisor_mode(new_state):
+        # Use a toast notification so it doesn't disrupt the UI layout
+        st.toast(f"Supervisor Mode {'ACTIVATED (0.5L)' if new_state else 'DEACTIVATED (0.1L)'}!")
+
 # --- 1. DATABASE STATE RESTORATION ---
 if 'data_restored' not in st.session_state:
     try:
@@ -122,8 +152,6 @@ if 'reset_ticket_threshold' not in st.session_state:
             midnight_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
             
             # Find the last ticket BEFORE local midnight
-            # Note: We pass this datetime to MT5. If Broker time != Local Time, this might need further tuning.
-            # Usually looking back from Local Midnight is safe.
             history_before = mt5.history_deals_get(midnight_local - timedelta(days=7), midnight_local)
             
             if history_before and len(history_before) > 0:
@@ -146,8 +174,29 @@ def main():
         st.error(f"Failed to connect to MT5 at {path}")
         return
 
-    # --- SIDEBAR: RESET BUTTON ---
+    # --- SIDEBAR: CONTROLS ---
     with st.sidebar:
+        st.header("Risk Management")
+        
+        # 1. Supervisor Mode Toggle
+        sizing_cfg = config.get('ml_pipeline', {}).get('alpha_filter', {}).get('dynamic_sizing', {})
+        current_state = sizing_cfg.get('supervisor_present', False)
+        
+        # Seed the initial memory state from the file (only runs once on first load)
+        if 'supervisor_switch' not in st.session_state:
+            st.session_state.supervisor_switch = current_state
+            
+        # The toggle now relies strictly on session memory and triggers the callback automatically
+        st.toggle(
+            "👁️ Supervisor Mode", 
+            key="supervisor_switch", 
+            on_change=on_supervisor_toggle, 
+            help="ON: Allows up to 0.5 Lots. OFF: Throttles AI to 0.1 Lots."
+        )
+        
+        st.divider()
+
+        # 2. Reset Tracking Button
         st.header("Session Controls")
         if st.button("🔄 Reset Tracking Today", type="primary"):
             st.session_state.history_data = []
@@ -163,6 +212,7 @@ def main():
                 st.session_state.reset_ticket_threshold = deals[-1].ticket
             
             st.success("Session View Reset!")
+            time.sleep(0.5)
             st.rerun()
 
     # --- CALCULATE LIVE METRICS ---
@@ -212,7 +262,6 @@ def main():
 
         kpi4.metric("Open Positions", f"{global_total_open}")
         
-        # Swapped the label and tag here
         kpi5.metric("Net Exposure", exposure_val, exposure_tag, delta_color=delta_color)
         
         kpi6.metric("Position Delta", f"{global_net_count:+}", help="Positive = More Buys, Negative = More Sells")

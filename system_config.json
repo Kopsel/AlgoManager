@@ -3,6 +3,8 @@
     "db_path": "trading_system.db",
     "zmq_host": "localhost",
     "zmq_port": 5555,
+    "zmq_brain_port": 5556,
+    "zmq_regime_port": 5557,
     "mt5_terminal_path": "E:\\FusionMarketsMT5\\terminal64.exe",
     "mt5_terminal_path2": "C:\\Program Files\\MetaTrader 5\\terminal64.exe",
     "broker_utc_offset_hours": 3,
@@ -10,7 +12,7 @@
   },
   "risk_management": {
     "basket_enabled": true,
-    "basket_take_profit_usd": 0.25
+    "basket_take_profit_usd": 0.5
   },
   "strategies": {
     "QT_Velocity": {
@@ -28,19 +30,21 @@
     "_comment_labeling": "Horizon is minutes to wait. Spread allowance forces trade to clear the bid/ask spread.",
     "labeling": {
       "horizon_minutes": 10,
-      "spread_allowance": 0.30
+      "spread_allowance": 0.3
     },
     "_comment_alpha_filter": "Subsample and colsample prevent overfitting. Scale_pos_weight punishes the AI for missing losses.",
     "alpha_filter": {
       "json_column_name": "features_json",
       "model_save_path": "ML_Pipeline/alpha_filter_v1.json",
-      "train_test_split": 0.80,
+      "train_test_split": 0.8,
       "dynamic_sizing": {
         "enabled": true,
-        "min_confidence_threshold": 0.50,
-        "min_volume": 0.02,
-        "max_volume": 0.20,
-        "curve_power": 2.0
+        "supervisor_present": true,
+        "min_confidence_threshold": 0.6,
+        "min_volume": 0.1,
+        "max_volume_supervised": 0.5,
+        "max_volume_unsupervised": 0.1,
+        "curve_power": 3.0
       },
       "xgb_params": {
         "max_depth": 4,
@@ -50,6 +54,32 @@
         "colsample_bytree": 0.8,
         "eval_metric": "logloss",
         "scale_pos_weight": 2.0
+      }
+    },
+    "_comment_vision_transformer": "SigLIP parameters. Algorithmic labeling uses ATR multipliers for dynamic volatility adjustment.",
+    "vision_transformer": {
+      "enabled": true,
+      "model_save_path": "ML_Pipeline/siglip_trading_brain_best.pt",
+      "data_generation": {
+        "window_size_minutes": 90,
+        "generation_interval_minutes": 15,
+        "canvas_resolution": 1024
+      },
+      "algorithmic_labeling": {
+        "forward_horizon_minutes": 45,
+        "target_atr_multiplier": 10.0,
+        "pain_atr_multiplier": 4.0
+      },
+      "classes": {
+        "0": "longs_only",
+        "1": "scalp_both",
+        "2": "shorts_only"
+      },
+      "training_params": {
+        "batch_size": 16,
+        "epochs": 10,
+        "learning_rate": 5e-05,
+        "train_test_split": 0.8
       }
     }
   }

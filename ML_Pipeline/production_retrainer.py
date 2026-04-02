@@ -35,17 +35,12 @@ def load_data():
             feature_row['hour'] = data['temporal']['hour']
             feature_row['day_of_week'] = data['temporal']['day_of_week']
             
-            # --- THE FIX: Safe Direction Extraction ---
-            # Attempt to get direction from the database column first.
-            # If it's missing (a blocked trade), safely calculate it from the JSON.
-            if pd.notna(row['trade_action']) and row['trade_action'] != "":
-                feature_row['is_buy'] = 1 if row['trade_action'] == 'BUY' else 0
-            else:
-                try:
-                    speed = float(data.get('trigger', {}).get('speed_delta', 0))
-                    feature_row['is_buy'] = 1 if speed < 0 else 0
-                except (ValueError, TypeError):
-                    feature_row['is_buy'] = 0 # Default fallback if speed is toxic
+            # --- FIXED: Pure JSON Direction Extraction ---
+            try:
+                speed = float(data.get('trigger', {}).get('speed_delta', 0))
+                feature_row['is_buy'] = 1 if speed < 0 else 0
+            except (ValueError, TypeError):
+                feature_row['is_buy'] = 0 # Default fallback if speed is toxic
 
             bids, asks = data['dom']['bid_sizes'], data['dom']['ask_sizes']
             total_liq = max(sum(bids) + sum(asks), 1)
@@ -55,6 +50,8 @@ def load_data():
             feature_row['target'] = row['target_label']
             features_list.append(feature_row)
         except Exception as e:
+            # Tip: If this ever fails again, print(e) here to see the silent error!
+            print(f"Row {row.get('id', 'Unknown')} failed: {e}")
             continue
             
     return pd.DataFrame(features_list)
@@ -78,7 +75,6 @@ def retrain_model():
     X = X.apply(pd.to_numeric, errors='coerce')
     
     # 2. Downcast to float32 BEFORE replacing inf. 
-    # This forces Python to trigger the exact same overflow XGBoost encounters in C++.
     X = X.astype('float32')
     
     # 3. Crush the newly exposed infinities into standard missing data (NaN)
@@ -90,7 +86,7 @@ def retrain_model():
 
     print("💾 Overwriting old AI brain...")
     model.save_model(MODEL_SAVE_PATH)
-    print(f"✅ V1 Model Upgraded successfully at {MODEL_SAVE_PATH}")
+    print(f"✅ V2 Model Upgraded successfully at {MODEL_SAVE_PATH}")
 
 if __name__ == "__main__":
     retrain_model()

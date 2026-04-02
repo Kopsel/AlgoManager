@@ -8,6 +8,7 @@ using TradingPlatform.BusinessLayer;
 using NetMQ;
 using NetMQ.Sockets;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 
 namespace ML_Telemetry
 {
@@ -34,11 +35,15 @@ namespace ML_Telemetry
         [InputParameter("VWAP Reset Hour (UTC)", 35)]
         public int VwapResetHourUtc = 22;
 
-        [InputParameter("ZMQ Address", 40)]
+        [InputParameter("ZMQ Brain Address", 40)]
         public string ZmqAddress = "tcp://localhost:5556";
+
+        [InputParameter("ZMQ Regime Address", 41)]
+        public string ZmqRegimeAddress = "tcp://localhost:5557";
         // ==========================================
 
         private RequestSocket _zmqSocket;
+        private RequestSocket _zmqRegimeSocket;
 
         // --- MEMORY BANKS ---
         private Queue<Last> _tickHistory;
@@ -65,10 +70,14 @@ namespace ML_Telemetry
         private double _dailyOpen = 0;
         private bool _runMacroUpdater = true;
 
+        // --- SIGLIP AI REGIME STATE ---
+        // 0 = Longs Only, 1 = Scalp Both (Chop), 2 = Shorts Only
+        private int _currentMacroRegime = 1;
+
         public ML_Telemetry() : base()
         {
             this.Name = "ML_Telemetry";
-            this.Description = "L2 Bot with AI Macro Anchors";
+            this.Description = "L2 Bot with AI Macro Anchors & SigLIP Watchtower";
         }
 
         protected override void OnCreated()
@@ -89,9 +98,9 @@ namespace ML_Telemetry
 
             PrimeVwapData();
 
-            // Start the 60-second background updater
             _runMacroUpdater = true;
             Task.Run(MacroUpdaterLoop);
+            Task.Run(RegimeUpdaterLoop);
 
             this.symbol.NewLast += SymbolOnNewLast;
             this.symbol.NewLevel2 += SymbolOnNewLevel2;
@@ -102,8 +111,12 @@ namespace ML_Telemetry
                 {
                     _zmqSocket = new RequestSocket();
                     _zmqSocket.Connect(ZmqAddress);
+
+                    _zmqRegimeSocket = new RequestSocket();
+                    _zmqRegimeSocket.Connect(ZmqRegimeAddress);
+
                     _isZmqConnected = true;
-                    Log($"✓ ZMQ Connected to Python ML Brain on {ZmqAddress}", StrategyLoggingLevel.Trading);
+                    Log($"✓ ZMQ Connected: Brain ({ZmqAddress}) | Watchtower ({ZmqRegimeAddress})", StrategyLoggingLevel.Trading);
                 }
                 catch (Exception ex)
                 {
@@ -122,7 +135,10 @@ namespace ML_Telemetry
 
             _runMacroUpdater = false;
             _isZmqConnected = false;
+
             _zmqSocket?.Dispose();
+            _zmqRegimeSocket?.Dispose();
+
             NetMQConfig.Cleanup(false);
             Log("ZMQ Disconnected.", StrategyLoggingLevel.Trading);
         }
@@ -130,6 +146,53 @@ namespace ML_Telemetry
         protected override void OnRemove()
         {
             this.symbol = null;
+        }
+
+        // ==========================================
+        // 🔭 5-MINUTE SIGLIP WATCHTOWER LOOP
+        // ==========================================
+        private async Task RegimeUpdaterLoop()
+        {
+            while (_runMacroUpdater && this.symbol != null)
+            {
+                try
+                {
+                    if (_isZmqConnected && _zmqRegimeSocket != null)
+                    {
+                        _zmqRegimeSocket.SendFrame("ping");
+
+                        string reply;
+                        if (_zmqRegimeSocket.TryReceiveFrameString(TimeSpan.FromSeconds(5), out reply))
+                        {
+                            var jsonResponse = JObject.Parse(reply);
+                            if (jsonResponse["status"]?.ToString() == "success")
+                            {
+                                int newRegime = (int)jsonResponse["signal"];
+                                string regimeName = jsonResponse["regime"]?.ToString();
+
+                                if (_currentMacroRegime != newRegime)
+                                {
+                                    Log($"🔭 WATCHTOWER: Regime Shift to {regimeName.ToUpper()} ({newRegime})", StrategyLoggingLevel.Trading);
+                                    _currentMacroRegime = newRegime;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            Log("⚠️ Watchtower Timeout. Reconnecting...", StrategyLoggingLevel.Error);
+                            _zmqRegimeSocket.Dispose();
+                            _zmqRegimeSocket = new RequestSocket();
+                            _zmqRegimeSocket.Connect(ZmqRegimeAddress);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log($"Regime Loop Error: {ex.Message}", StrategyLoggingLevel.Error);
+                }
+
+                await Task.Delay(300000);
+            }
         }
 
         // ==========================================
@@ -155,31 +218,24 @@ namespace ML_Telemetry
         {
             DateTime now = Core.Instance.TimeUtils.DateTimeUtcNow;
 
-            // 1. Get Daily Open
             using (var d1History = this.symbol.GetHistory(Period.DAY1, now.AddDays(-3), now))
             {
                 if (d1History != null && d1History.Count > 0)
                 {
-                    var candles = new List<IHistoryItem>();
-                    foreach (IHistoryItem item in d1History) candles.Add(item);
-
-                    var latestDaily = candles.OrderByDescending(x => x.TimeLeft).FirstOrDefault();
-                    if (latestDaily != null) _dailyOpen = latestDaily[PriceType.Open];
+                    var latestDaily = d1History.OrderByDescending(x => x.TimeLeft).FirstOrDefault();
+                    if (latestDaily != null)
+                    {
+                        _dailyOpen = latestDaily[PriceType.Open];
+                    }
                 }
             }
 
-            // 2. Get 1H History (Pull 10 days to ensure enough candles for smooth ATR)
             using (var h1History = this.symbol.GetHistory(Period.HOUR1, now.AddDays(-10), now))
             {
                 if (h1History != null && h1History.Count >= 20)
                 {
-                    var candles = new List<IHistoryItem>();
-                    foreach (IHistoryItem item in h1History) candles.Add(item);
+                    var newestCandles = h1History.OrderByDescending(x => x.TimeLeft).ToList();
 
-                    // Force sorting: Newest candles at index 0, 1, 2...
-                    var newestCandles = candles.OrderByDescending(x => x.TimeLeft).ToList();
-
-                    // --- Calculate 1H SMA (20-period) ---
                     double sumClose = 0;
                     int smaCount = Math.Min(20, newestCandles.Count);
                     for (int i = 0; i < smaCount; i++)
@@ -188,40 +244,32 @@ namespace ML_Telemetry
                     }
                     _sma1h = sumClose / smaCount;
 
-                    // --- Calculate 1H ATR (14-period Wilder's Smoothing) ---
-                    int atrCount = Math.Min(100, newestCandles.Count);
-                    var atrCandles = newestCandles.Take(atrCount).ToList();
+                    int atrCount = Math.Min(20, newestCandles.Count);
+                    double sumTr = 0;
 
-                    // Reverse to chronological order (Oldest first) for correct smoothing math
-                    atrCandles.Reverse();
-
-                    double currentAtr = 0;
-                    for (int i = 1; i < atrCandles.Count; i++)
+                    for (int i = 0; i < atrCount; i++)
                     {
-                        double high = atrCandles[i][PriceType.High];
-                        double low = atrCandles[i][PriceType.Low];
-                        double prevClose = atrCandles[i - 1][PriceType.Close];
+                        double high = newestCandles[i][PriceType.High];
+                        double low = newestCandles[i][PriceType.Low];
+
+                        // newestCandles is ordered newest to oldest. 
+                        // So index [i+1] is the chronologically previous candle.
+                        double prevClose = (i + 1 < newestCandles.Count) ? newestCandles[i + 1][PriceType.Close] : newestCandles[i][PriceType.Open];
 
                         double tr1 = high - low;
                         double tr2 = Math.Abs(high - prevClose);
                         double tr3 = Math.Abs(low - prevClose);
-                        double tr = Math.Max(tr1, Math.Max(tr2, tr3));
 
-                        if (i == 1)
-                        {
-                            currentAtr = tr;
-                        }
-                        else
-                        {
-                            currentAtr = ((currentAtr * 13) + tr) / 14.0; // Wilder's Smoothing
-                        }
+                        sumTr += Math.Max(tr1, Math.Max(tr2, tr3));
                     }
-                    if (currentAtr > 0) _atr1h = currentAtr;
+
+                    if (atrCount > 0)
+                    {
+                        _atr1h = sumTr / atrCount;
+                    }
                 }
             }
         }
-
-        // ==========================================
 
         private void PrimeVwapData()
         {
@@ -230,32 +278,29 @@ namespace ML_Telemetry
                 DateTime now = Core.Instance.TimeUtils.DateTimeUtcNow;
                 DateTime startTime = new DateTime(now.Year, now.Month, now.Day, VwapResetHourUtc, 0, 0, DateTimeKind.Utc);
 
-                if (startTime > now) startTime = startTime.AddDays(-1);
+                if (startTime > now)
+                {
+                    startTime = startTime.AddDays(-1);
+                }
 
                 using (var history = this.symbol.GetHistory(Period.MIN1, startTime, now))
                 {
                     _cumulativePriceVolume = 0;
                     _cumulativeVolume = 0;
-
                     if (history != null)
                     {
                         foreach (IHistoryItem item in history)
                         {
-                            double close = item[PriceType.Close];
-                            double volume = item[PriceType.Volume];
-
-                            _cumulativeVolume += volume;
-                            _cumulativePriceVolume += (close * volume);
+                            _cumulativeVolume += item[PriceType.Volume];
+                            _cumulativePriceVolume += (item[PriceType.Close] * item[PriceType.Volume]);
                         }
                     }
                 }
-
                 _lastVwapReset = startTime;
-                Log($"✅ VWAP Primed! Started tracking from {startTime:HH:mm} UTC.", StrategyLoggingLevel.Trading);
             }
             catch (Exception ex)
             {
-                Log($"Warning: Could not prime historical VWAP: {ex.Message}", StrategyLoggingLevel.Error);
+                Log($"VWAP Prime Error: {ex.Message}", StrategyLoggingLevel.Error);
             }
         }
 
@@ -263,7 +308,6 @@ namespace ML_Telemetry
         {
             lock (_lockObject)
             {
-                // 1. VWAP CALCULATION
                 if (last.Time.Hour == VwapResetHourUtc && (last.Time - _lastVwapReset).TotalHours > 12)
                 {
                     _cumulativePriceVolume = 0;
@@ -275,37 +319,36 @@ namespace ML_Telemetry
                 _cumulativePriceVolume += (last.Price * last.Size);
                 double currentVwap = _cumulativeVolume > 0 ? (_cumulativePriceVolume / _cumulativeVolume) : last.Price;
 
-                // 2. 1-MINUTE OHLC QUEUE
                 _oneMinHistory.Enqueue(last);
-                DateTime oneMinCutoff = last.Time.AddMinutes(-1);
-                while (_oneMinHistory.Count > 0 && _oneMinHistory.Peek().Time < oneMinCutoff)
+                while (_oneMinHistory.Count > 0 && _oneMinHistory.Peek().Time < last.Time.AddMinutes(-1))
+                {
                     _oneMinHistory.Dequeue();
+                }
 
-                // 3. 5-MINUTE OHLC QUEUE
                 _fiveMinHistory.Enqueue(last);
-                DateTime fiveMinCutoff = last.Time.AddMinutes(-5);
-                while (_fiveMinHistory.Count > 0 && _fiveMinHistory.Peek().Time < fiveMinCutoff)
+                while (_fiveMinHistory.Count > 0 && _fiveMinHistory.Peek().Time < last.Time.AddMinutes(-5))
+                {
                     _fiveMinHistory.Dequeue();
+                }
 
-                // 4. GET CURRENT IMBALANCE SNAPSHOT
                 double currentImbalance = 0;
                 var dom = this.symbol.DepthOfMarket.GetDepthOfMarketAggregatedCollections();
+
                 if (dom != null && dom.Bids != null && dom.Asks != null)
                 {
                     double totalBid = dom.Bids.Take(10).Sum(b => b.Size);
                     double totalAsk = dom.Asks.Take(10).Sum(a => a.Size);
+
                     if (totalBid + totalAsk > 0)
                     {
                         currentImbalance = Math.Round(((totalBid - totalAsk) / (totalBid + totalAsk)) * 100, 2);
                     }
                 }
 
-                // 5. 2-SECOND SPEED & IMBALANCE QUEUES
                 _tickHistory.Enqueue(last);
                 _tickImbalanceHistory.Enqueue(currentImbalance);
-                DateTime speedCutoff = last.Time.AddMilliseconds(-TimeWindowMs);
 
-                while (_tickHistory.Count > 0 && _tickHistory.Peek().Time < speedCutoff)
+                while (_tickHistory.Count > 0 && _tickHistory.Peek().Time < last.Time.AddMilliseconds(-TimeWindowMs))
                 {
                     _tickHistory.Dequeue();
                     _tickImbalanceHistory.Dequeue();
@@ -315,68 +358,66 @@ namespace ML_Telemetry
                 {
                     var oldestSpeedTick = _tickHistory.Peek();
                     double speedDelta = Math.Round(last.Price - oldestSpeedTick.Price, 2);
-
-                    double actualTimeMs = (last.Time - oldestSpeedTick.Time).TotalMilliseconds;
-                    if (actualTimeMs == 0) actualTimeMs = 1;
+                    double actualTimeMs = Math.Max(1, (last.Time - oldestSpeedTick.Time).TotalMilliseconds);
                     double pointsPerSecond = Math.Round(speedDelta / (actualTimeMs / 1000.0), 2);
 
-                    double minutesStored = _fiveMinHistory.Count > 0 ? (last.Time - _fiveMinHistory.Peek().Time).TotalMinutes : 0;
-
-                    // DYNAMIC THRESHOLD MATH
-                    if (minutesStored >= 4.9 && last.Time.Second != _lastCalcSecond)
+                    if (_fiveMinHistory.Count > 0 && last.Time.Second != _lastCalcSecond)
                     {
-                        double pa5mHigh = _fiveMinHistory.Max(t => t.Price);
-                        double pa5mLow = _fiveMinHistory.Min(t => t.Price);
-                        double range5m = pa5mHigh - pa5mLow;
-
+                        double range5m = _fiveMinHistory.Max(t => t.Price) - _fiveMinHistory.Min(t => t.Price);
                         _dynamicSpeedThreshold = Math.Max(MinSpikeFloor, Math.Round(range5m * VolMultiplier, 2));
                         _lastCalcSecond = last.Time.Second;
                     }
 
-                    bool cooldownOver = (DateTime.Now - _lastTriggerTime).TotalMilliseconds > CooldownMs;
-
-                    // --- ADAPTIVE TRIGGER ---
-                    if (Math.Abs(speedDelta) >= _dynamicSpeedThreshold && minutesStored >= 4.9 && cooldownOver)
+                    if (Math.Abs(speedDelta) >= _dynamicSpeedThreshold && (DateTime.Now - _lastTriggerTime).TotalMilliseconds > CooldownMs)
                     {
-                        int tickCount = _tickHistory.Count;
+                        double vwapDistPct = currentVwap > 0 ? Math.Round(((last.Price - currentVwap) / currentVwap) * 100, 4) : 0;
+                        double pa5mRange = Math.Max(0.01, Math.Round(_fiveMinHistory.Max(t => t.Price) - _fiveMinHistory.Min(t => t.Price), 2));
+
                         double volumeInWindow = _tickHistory.Sum(t => t.Size);
                         double absorptionRatio = speedDelta != 0 ? Math.Round(volumeInWindow / Math.Abs(speedDelta), 2) : 0;
 
-                        double vwapDistPct = currentVwap > 0 ? Math.Round(((last.Price - currentVwap) / currentVwap) * 100, 4) : 0;
+                        double pa5mOpenNorm = Math.Round((_fiveMinHistory.Peek().Price - last.Price) / pa5mRange, 3);
+                        double pa5mHighNorm = Math.Round((_fiveMinHistory.Max(t => t.Price) - last.Price) / pa5mRange, 3);
+                        double pa5mLowNorm = Math.Round((_fiveMinHistory.Min(t => t.Price) - last.Price) / pa5mRange, 3);
 
-                        double pa5mOpenNorm = 0, pa5mHighNorm = 0, pa5mLowNorm = 0, pa5mRange = 0;
-                        if (_fiveMinHistory.Count > 0)
-                        {
-                            double pa5mOpen = _fiveMinHistory.Peek().Price;
-                            double pa5mHigh = _fiveMinHistory.Max(t => t.Price);
-                            double pa5mLow = _fiveMinHistory.Min(t => t.Price);
-
-                            pa5mRange = Math.Round(pa5mHigh - pa5mLow, 2);
-
-                            if (pa5mRange > 0)
-                            {
-                                pa5mOpenNorm = Math.Round((pa5mOpen - last.Price) / pa5mRange, 3);
-                                pa5mHighNorm = Math.Round((pa5mHigh - last.Price) / pa5mRange, 3);
-                                pa5mLowNorm = Math.Round((pa5mLow - last.Price) / pa5mRange, 3);
-                            }
-                        }
-
-                        double sma1m = _oneMinHistory.Count > 0 ? Math.Round(_oneMinHistory.Average(t => t.Price), 2) : last.Price;
-                        double sma5m = _fiveMinHistory.Count > 0 ? Math.Round(_fiveMinHistory.Average(t => t.Price), 2) : last.Price;
+                        double sma1m = Math.Round(_oneMinHistory.Average(t => t.Price), 2);
+                        double sma5m = Math.Round(_fiveMinHistory.Average(t => t.Price), 2);
                         double trendDist = Math.Round(sma1m - sma5m, 2);
-                        int activityTicks = _fiveMinHistory.Count;
 
                         double imbalanceAgo = _tickImbalanceHistory.Peek();
                         double imbalanceShift = Math.Round(currentImbalance - imbalanceAgo, 2);
 
-                        // --- CALCULATE THE MACRO DISTANCES FOR THE JSON ---
                         double sma1hDistPct = _sma1h > 0 ? Math.Round(((last.Price - _sma1h) / _sma1h) * 100, 4) : 0;
                         double dailyOpenDistPct = _dailyOpen > 0 ? Math.Round(((last.Price - _dailyOpen) / _dailyOpen) * 100, 4) : 0;
                         double atr1hRound = Math.Round(_atr1h, 4);
 
+                        // 🚀 RESTORED SPIKE LOG
                         Log($"🚨 SPIKE: {speedDelta:F2} pts | 1H SMA Dist: {sma1hDistPct}% | ATR: {atr1hRound}", StrategyLoggingLevel.Trading);
 
-                        TriggerMLSnapshot(speedDelta, pointsPerSecond, actualTimeMs, tickCount, volumeInWindow, absorptionRatio, vwapDistPct, pa5mOpenNorm, pa5mHighNorm, pa5mLowNorm, pa5mRange, sma1m, sma5m, trendDist, activityTicks, currentImbalance, imbalanceAgo, imbalanceShift, sma1hDistPct, dailyOpenDistPct, atr1hRound, dom);
+                        TriggerMLSnapshot(
+                            speedDelta,
+                            pointsPerSecond,
+                            actualTimeMs,
+                            _tickHistory.Count,
+                            volumeInWindow,
+                            absorptionRatio,
+                            vwapDistPct,
+                            pa5mOpenNorm,
+                            pa5mHighNorm,
+                            pa5mLowNorm,
+                            pa5mRange,
+                            sma1m,
+                            sma5m,
+                            trendDist,
+                            _fiveMinHistory.Count,
+                            currentImbalance,
+                            imbalanceAgo,
+                            imbalanceShift,
+                            sma1hDistPct,
+                            dailyOpenDistPct,
+                            atr1hRound,
+                            dom
+                        );
 
                         _lastTriggerTime = DateTime.Now;
                     }
@@ -384,7 +425,12 @@ namespace ML_Telemetry
             }
         }
 
-        private void TriggerMLSnapshot(double speedDelta, double pointsPerSec, double actualTimeMs, int tickCount, double volWindow, double absorption, double vwapDistPct, double openNorm, double highNorm, double lowNorm, double range, double sma1m, double sma5m, double trendDist, int activityTicks, double currentImb, double agoImb, double shiftImb, double sma1hDistPct, double dailyOpenDistPct, double atr1hRound, DepthOfMarketAggregatedCollections domData)
+        private void TriggerMLSnapshot(
+            double speedDelta, double pointsPerSec, double actualTimeMs, int tickCount, double volWindow,
+            double absorption, double vwapDistPct, double openNorm, double highNorm, double lowNorm,
+            double range, double sma1m, double sma5m, double trendDist, int activityTicks,
+            double currentImb, double agoImb, double shiftImb, double sma1hDistPct,
+            double dailyOpenDistPct, double atr1hRound, DepthOfMarketAggregatedCollections domData)
         {
             if (!_isZmqConnected) return;
 
@@ -417,19 +463,18 @@ namespace ML_Telemetry
                         pa_5m_high_norm = highNorm,
                         pa_5m_low_norm = lowNorm,
                         pa_5m_range = range,
-
                         sma_1m = sma1m,
                         sma_5m = sma5m,
                         trend_dist = trendDist,
                         activity_5m_ticks = activityTicks,
-
                         imbalance_current = currentImb,
                         imbalance_ago = agoImb,
                         imbalance_shift = shiftImb,
-
                         sma_1h_dist_pct = sma1hDistPct,
                         daily_open_dist_pct = dailyOpenDistPct,
-                        atr_1h = atr1hRound
+                        atr_1h = atr1hRound,
+
+                        macro_regime_state = _currentMacroRegime
                     },
                     temporal = new
                     {
@@ -437,16 +482,18 @@ namespace ML_Telemetry
                         minute = DateTime.UtcNow.Minute,
                         day_of_week = (int)DateTime.UtcNow.DayOfWeek
                     },
-                    dom = new { bid_sizes = bids, ask_sizes = asks }
+                    dom = new
+                    {
+                        bid_sizes = bids,
+                        ask_sizes = asks
+                    }
                 };
 
                 string json = JsonConvert.SerializeObject(payload);
                 _zmqSocket.SendFrame(json);
 
-                string mlDecision;
-                bool gotReply = _zmqSocket.TryReceiveFrameString(TimeSpan.FromMilliseconds(500), out mlDecision);
-
-                if (!gotReply)
+                string reply;
+                if (!_zmqSocket.TryReceiveFrameString(TimeSpan.FromMilliseconds(500), out reply))
                 {
                     Log("⚠️ ZMQ Timeout: No ACK from Python. Resetting socket...", StrategyLoggingLevel.Error);
                     _zmqSocket.Dispose();

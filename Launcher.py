@@ -9,6 +9,7 @@ CONFIG_FILE = "system_config.json"
 MANAGER_SCRIPT = "Trade_Manager.py"
 DASHBOARD_SCRIPT = "Dashboard.py"
 BRAIN_SCRIPT = os.path.join("ML_Pipeline", "ML_Brain.py") # <--- THE NEW BRAIN
+REGIME_SCRIPT = os.path.join("Regime_Filter", "Regime_Server.py") # <--- THE NEW WATCHTOWER
 
 def load_config():
     if not os.path.exists(CONFIG_FILE):
@@ -63,7 +64,17 @@ def main():
         print(f"CRITICAL: {BRAIN_SCRIPT} not found.")
         return
 
-    # 3. Start Dashboard (UI)
+    # 3. Start Regime Watchtower (SigLIP Image Filter)
+    if os.path.exists(REGIME_SCRIPT):
+        print("Launcher: Starting Regime Watchtower...")
+        CREATE_NEW_CONSOLE = subprocess.CREATE_NEW_CONSOLE if os.name == 'nt' else 0
+        regime_proc = subprocess.Popen(["cmd", "/k", "python", REGIME_SCRIPT], creationflags=CREATE_NEW_CONSOLE)
+        processes.append(regime_proc)
+    else:
+        print(f"⚠️ Warning: {REGIME_SCRIPT} not found. Running without Macro Filter.")
+        regime_proc = None
+
+    # 4. Start Dashboard (UI)
     dash_proc = None
     if os.path.exists(DASHBOARD_SCRIPT):
         dash_proc = launch_dashboard()
@@ -73,7 +84,7 @@ def main():
     print(f"\n--- SYSTEM RUNNING: {len(processes)} Processes Active ---")
     print("Keep this window open. Press Ctrl+C to kill all bots.")
 
-    # 4. Monitor Loop
+    # 5. Monitor Loop
     try:
         while True:
             time.sleep(2)
@@ -82,6 +93,9 @@ def main():
                 break
             if brain_proc.poll() is not None:
                 print("CRITICAL: ML Brain died! Shutting down system.")
+                break
+            if regime_proc and regime_proc.poll() is not None:
+                print("CRITICAL: Regime Watchtower died! Shutting down system.")
                 break
             if dash_proc is not None and dash_proc.poll() is not None:
                 print("⚠️ WARNING: Dashboard crashed. Restarting...")

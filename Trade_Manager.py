@@ -20,7 +20,6 @@ SNAPSHOT_INTERVAL = 60
 tracked_tickets = {}
 trade_metadata = {}  
 trade_mfe_mae = {}   
-system_locked = False 
 basket_start_equity = None 
 
 db = Database()
@@ -208,7 +207,7 @@ def check_closed_trades():
                 "sl": sl_mem,  
                 "tp": tp_mem,  
                 "net_pnl": round(net_pl, 2),
-                "pnl_points": round(pnl_pts, 2), # FIX: Added the missing Point PnL!
+                "pnl_points": round(pnl_pts, 2),
                 "commission": exit_deal.commission,
                 "swap": exit_deal.swap,
                 "reason": reason,
@@ -244,9 +243,14 @@ def close_all_positions(reason="Global Basket Trigger"):
         mt5.order_send(request)
 
 def check_basket_logic():
-    global system_locked, basket_start_equity
-    if system_locked: return
+    global basket_start_equity
     load_config() 
+    
+    # --- EMERGENCY SYSTEM LOCK CHECK ---
+    risk_cfg = config.get('risk_management', {}).get('emergency_protocols', {})
+    if risk_cfg.get('system_locked', False): 
+        return
+        
     risk = config.get('risk_management', {})
     
     if not risk.get('basket_enabled', False):
@@ -277,8 +281,13 @@ def check_basket_logic():
             basket_start_equity = None
 
 def execute_trade(signal_data):
-    if system_locked: return "Manager: REJECTED (System Locked)"
     load_config()
+    
+    # --- EMERGENCY SYSTEM LOCK CHECK ---
+    risk_cfg = config.get('risk_management', {}).get('emergency_protocols', {})
+    if risk_cfg.get('system_locked', False): 
+        return "Manager: REJECTED (Emergency System Lock Active)"
+        
     strategies = config.get('strategies', {})
     strat_id = signal_data['strategy_id']
     if strat_id not in strategies: return "Manager: Unknown Strategy"
@@ -336,7 +345,6 @@ def execute_trade(signal_data):
     tracked_tickets[result.order] = strat_id
     trade_mfe_mae[result.order] = {'mfe': 0.0, 'mae': 0.0}
     
-    # Force the manager to remember the exact SL and TP we requested
     meta = signal_data.get('extra_metrics', {})
     meta['sl_price_memory'] = sl_price
     meta['tp_price_memory'] = tp_price

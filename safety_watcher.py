@@ -31,35 +31,36 @@ def fetch_tier1_news():
         
         if resp.status_code == 200:
             events = resp.json()
-            eastern = pytz.timezone('US/Eastern')
             
             for ev in events:
+                # Target only High Impact USD events
                 if ev.get('country') == 'USD' and ev.get('impact') == 'High':
-                    date_str = ev.get('date') 
-                    time_str = ev.get('time') 
+                    date_str = ev.get('date') # Format: 2026-04-02T08:30:00-04:00
                     
-                    if not time_str or "Day" in time_str:
+                    if not date_str:
                         continue 
                         
-                    dt_str = f"{date_str} {time_str}"
                     try:
-                        dt_naive = datetime.strptime(dt_str, '%m-%d-%Y %I:%M%p')
-                        dt_eastern = eastern.localize(dt_naive)
-                        event_timestamp = dt_eastern.timestamp()
+                        # Python natively parses the ISO string and calculates the timezone offset
+                        dt_aware = datetime.fromisoformat(date_str)
+                        event_timestamp = dt_aware.timestamp()
                         
+                        # Only track it if the news hasn't happened yet
                         if event_timestamp > time.time():
                             tier1_times.append(event_timestamp)
-                            local_time_str = datetime.fromtimestamp(event_timestamp).strftime('%H:%M:%S')
+                            local_time_str = datetime.fromtimestamp(event_timestamp).strftime('%m-%d at %H:%M:%S')
                             print(f"   📅 HIGH IMPACT NEWS LOGGED: {ev.get('title')} at {local_time_str} Local Time")
-                    except ValueError:
+                    except ValueError as e:
+                        print(f"   [ERROR] Failed to parse date: '{date_str}' - {e}")
                         continue
         else:
             print(f"❌ Forex Factory API Error: HTTP {resp.status_code}")
     except Exception as e:
         print(f"❌ News API Connection Error: {e}")
-
-    print(f"   ✅ Calendar parsed successfully! Tracking {len(tier1_times)} upcoming Tier-1 events.")
         
+    
+    print(f"   ✅ Calendar parsed successfully! Tracking {len(tier1_times)} upcoming Tier-1 events.")
+    
     return tier1_times
 
 def execute_hedge_and_lock(symbol, reason):

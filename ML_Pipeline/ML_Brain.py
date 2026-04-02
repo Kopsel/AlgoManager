@@ -67,8 +67,13 @@ def calculate_dynamic_size(confidence):
     volume = min_vol + (top_heavy_scale * (max_vol - min_vol))
     return float(round(volume, 2))
 
-# ... [Keep process_qt_velocity and process_qt_trend exactly the same] ...
 def process_qt_velocity(payload):
+    # --- EMERGENCY SYSTEM LOCK CHECK ---
+    risk_cfg = config.get('risk_management', {}).get('emergency_protocols', {})
+    if risk_cfg.get('system_locked', False): 
+        action = "BUY" if payload.get('trigger', {}).get('speed_delta', 0) < 0 else "SELL"
+        return action, {"confidence": 0.0}, 0.0, True # Force the block
+        
     trigger = payload.get('trigger', {})
     
     if ai_model is None:
@@ -131,6 +136,11 @@ def process_qt_velocity(payload):
     return action, custom_metrics, volume, final_blocked
 
 def process_qt_trend(payload):
+    # --- EMERGENCY SYSTEM LOCK CHECK ---
+    risk_cfg = config.get('risk_management', {}).get('emergency_protocols', {})
+    if risk_cfg.get('system_locked', False): 
+        return "BUY", {}, None, True # Force the block
+        
     return "BUY", {}, None, False
 
 def run_ml_brain():
@@ -149,7 +159,7 @@ def run_ml_brain():
 
     try:
         while True:
-            # --- UPGRADE: HOT RELOAD CHECK ---
+            # --- HOT RELOAD CHECK ---
             load_config_and_model() 
             
             message = receiver_socket.recv_string()

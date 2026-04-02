@@ -10,3 +10,4 @@ streamlit-lightweight-charts
 xgboost
 matplotlib
 scikit-learn
+requests

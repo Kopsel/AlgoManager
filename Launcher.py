@@ -8,8 +8,9 @@ import os
 CONFIG_FILE = "system_config.json"
 MANAGER_SCRIPT = "Trade_Manager.py"
 DASHBOARD_SCRIPT = "Dashboard.py"
-BRAIN_SCRIPT = os.path.join("ML_Pipeline", "ML_Brain.py") # <--- THE NEW BRAIN
-REGIME_SCRIPT = os.path.join("Regime_Filter", "Regime_Server.py") # <--- THE NEW WATCHTOWER
+SAFETY_SCRIPT = "safety_watcher.py" # <--- THE NEW SAFETY DAEMON
+BRAIN_SCRIPT = os.path.join("ML_Pipeline", "ML_Brain.py")
+REGIME_SCRIPT = os.path.join("Regime_Filter", "Regime_Server.py")
 
 def load_config():
     if not os.path.exists(CONFIG_FILE):
@@ -57,7 +58,6 @@ def main():
     if os.path.exists(BRAIN_SCRIPT):
         print("Launcher: Starting ML Brain...")
         CREATE_NEW_CONSOLE = subprocess.CREATE_NEW_CONSOLE if os.name == 'nt' else 0
-        # cmd /k keeps the window open so you can see the Quantower signals arriving!
         brain_proc = subprocess.Popen(["cmd", "/k", "python", BRAIN_SCRIPT], creationflags=CREATE_NEW_CONSOLE)
         processes.append(brain_proc)
     else:
@@ -74,7 +74,17 @@ def main():
         print(f"⚠️ Warning: {REGIME_SCRIPT} not found. Running without Macro Filter.")
         regime_proc = None
 
-    # 4. Start Dashboard (UI)
+    # 4. Start Safety Watcher (Crash & News Daemon)
+    if os.path.exists(SAFETY_SCRIPT):
+        print("Launcher: Starting Safety Watcher...")
+        CREATE_NEW_CONSOLE = subprocess.CREATE_NEW_CONSOLE if os.name == 'nt' else 0
+        watcher_proc = subprocess.Popen(["cmd", "/k", "python", SAFETY_SCRIPT], creationflags=CREATE_NEW_CONSOLE)
+        processes.append(watcher_proc)
+    else:
+        print(f"CRITICAL: {SAFETY_SCRIPT} not found.")
+        return
+
+    # 5. Start Dashboard (UI)
     dash_proc = None
     if os.path.exists(DASHBOARD_SCRIPT):
         dash_proc = launch_dashboard()
@@ -84,7 +94,7 @@ def main():
     print(f"\n--- SYSTEM RUNNING: {len(processes)} Processes Active ---")
     print("Keep this window open. Press Ctrl+C to kill all bots.")
 
-    # 5. Monitor Loop
+    # 6. Monitor Loop
     try:
         while True:
             time.sleep(2)
@@ -93,6 +103,9 @@ def main():
                 break
             if brain_proc.poll() is not None:
                 print("CRITICAL: ML Brain died! Shutting down system.")
+                break
+            if watcher_proc.poll() is not None:
+                print("CRITICAL: Safety Watcher died! Shutting down system.")
                 break
             if regime_proc and regime_proc.poll() is not None:
                 print("CRITICAL: Regime Watchtower died! Shutting down system.")

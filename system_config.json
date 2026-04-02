@@ -12,7 +12,21 @@
   },
   "risk_management": {
     "basket_enabled": true,
-    "basket_take_profit_usd": 0.5
+    "basket_take_profit_usd": 0.5,
+    "emergency_protocols": {
+      "system_locked": false,
+      "flash_crash_watcher": {
+        "enabled": true,
+        "adr_days": 14,
+        "adr_fraction_threshold": 0.15,
+        "evaluation_window_seconds": 3
+      },
+      "news_watcher": {
+        "enabled": true,
+        "flatten_minutes_before_tier1": 5
+      },
+      "saved_sl_tp": {}
+    }
   },
   "strategies": {
     "QT_Velocity": {

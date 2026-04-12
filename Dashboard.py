@@ -54,7 +54,6 @@ def toggle_system_lock_and_hedge(new_state):
         with open(config_path, 'r') as f:
             cfg = json.load(f)
             
-        # Ensure MT5 is connected because Streamlit callbacks run before main()
         path = cfg.get('system', {}).get('mt5_terminal_path')
         mt5.initialize(path=path)
 
@@ -211,10 +210,8 @@ if 'data_restored' not in st.session_state:
         st.session_state['history_data'] = equity_clean[-200:] if len(equity_clean) > 200 else equity_clean.copy()
         
         st.session_state['data_restored'] = True
-        print(f"Dashboard: Restored {len(equity_clean)} Snapshots")
         
     except Exception as e:
-        print(f"Dashboard Load Error: {e}")
         st.session_state['daily_pnl'] = 0.0
         st.session_state['daily_trades'] = 0
         st.session_state['history_data'] = []
@@ -244,6 +241,52 @@ if 'reset_ticket_threshold' not in st.session_state:
     else:
         st.session_state.reset_ticket_threshold = 0
 
+# --- ISOLATED FRAGMENT FOR TOP KPIS ---
+@st.fragment(run_every=1)
+def render_top_kpis():
+    acc = mt5.account_info()
+    positions = mt5.positions_get()
+    
+    global_net_lots = 0.0
+    global_net_count = 0
+    global_total_open = 0
+    
+    if positions:
+        for pos in positions:
+            global_total_open += 1
+            if pos.type == mt5.POSITION_TYPE_BUY:
+                global_net_lots += pos.volume
+                global_net_count += 1
+            elif pos.type == mt5.POSITION_TYPE_SELL:
+                global_net_lots -= pos.volume
+                global_net_count -= 1
+
+    if global_net_lots > 0:
+        exposure_val = f"{global_net_lots:+.2f} Lots"
+        exposure_tag = "LONG 🐂"
+        delta_color = "normal" 
+    elif global_net_lots < 0:
+        exposure_val = f"{global_net_lots:+.2f} Lots"
+        exposure_tag = "-SHORT 🐻"
+        delta_color = "normal" 
+    else:
+        exposure_val = "0.00 Lots"
+        exposure_tag = "FLAT ⚪"
+        delta_color = "off"
+
+    if acc:
+        kpi1, kpi2, kpi3, kpi4, kpi5, kpi6 = st.columns(6)
+        
+        kpi1.metric("Balance", f"${acc.balance:,.2f}")
+        kpi2.metric("Equity", f"${acc.equity:,.2f}", delta=f"{acc.equity - acc.balance:.2f}")
+        
+        daily_pnl = st.session_state.get('daily_pnl', 0.0)
+        daily_trades = st.session_state.get('daily_trades', 0)
+        kpi3.metric("Daily PnL", f"${daily_pnl:,.2f}", f"{daily_trades} Trades")
+        kpi4.metric("Open Positions", f"{global_total_open}")
+        kpi5.metric("Net Exposure", exposure_val, exposure_tag, delta_color=delta_color)
+        kpi6.metric("Position Delta", f"{global_net_count:+}", help="Positive = More Buys, Negative = More Sells")
+
 def main():
     st.title("⚡ Algo Command")
     
@@ -255,7 +298,6 @@ def main():
         st.error(f"Failed to connect to MT5 at {path}")
         return
 
-    # --- SIDEBAR: CONTROLS ---
     with st.sidebar:
         st.header("Risk Management")
         
@@ -305,67 +347,22 @@ def main():
             time.sleep(0.5)
             st.rerun()
 
-    # --- CALCULATE LIVE METRICS ---
-    acc = mt5.account_info()
-    strategies = config.get('strategies', {})
-    positions = mt5.positions_get()
-    
-    global_net_lots = 0.0
-    global_net_count = 0
-    global_total_open = 0
-    
-    if positions:
-        for pos in positions:
-            global_total_open += 1
-            if pos.type == mt5.POSITION_TYPE_BUY:
-                global_net_lots += pos.volume
-                global_net_count += 1
-            elif pos.type == mt5.POSITION_TYPE_SELL:
-                global_net_lots -= pos.volume
-                global_net_count -= 1
-
-    if global_net_lots > 0:
-        exposure_val = f"{global_net_lots:+.2f} Lots"
-        exposure_tag = "LONG 🐂"
-        delta_color = "normal" 
-    elif global_net_lots < 0:
-        exposure_val = f"{global_net_lots:+.2f} Lots"
-        exposure_tag = "-SHORT 🐻"
-        delta_color = "normal" 
-    else:
-        exposure_val = "0.00 Lots"
-        exposure_tag = "FLAT ⚪"
-        delta_color = "off"
-
-    if acc:
-        kpi1, kpi2, kpi3, kpi4, kpi5, kpi6 = st.columns(6)
-        
-        kpi1.metric("Balance", f"${acc.balance:,.2f}")
-        kpi2.metric("Equity", f"${acc.equity:,.2f}", delta=f"{acc.equity - acc.balance:.2f}")
-        
-        daily_pnl = st.session_state.get('daily_pnl', 0.0)
-        daily_trades = st.session_state.get('daily_trades', 0)
-        kpi3.metric("Daily PnL", f"${daily_pnl:,.2f}", f"{daily_trades} Trades")
-        kpi4.metric("Open Positions", f"{global_total_open}")
-        kpi5.metric("Net Exposure", exposure_val, exposure_tag, delta_color=delta_color)
-        kpi6.metric("Position Delta", f"{global_net_count:+}", help="Positive = More Buys, Negative = More Sells")
+    # Call the isolated fragment for metrics
+    render_top_kpis()
 
     # --- TABS ---
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 Live Pulse", "⚙️ Strategy Lab", "📜 History", "🗄️ Journal", "📊 Analytics"])
 
     with tab1:
-        render_live_panel(strategies, config)
+        render_live_panel(strategies=config.get('strategies', {}), config=config)
     with tab2:
-        render_strategy_lab(strategies, config)
+        render_strategy_lab(config.get('strategies', {}), config)
     with tab3:
-        render_history_tab(strategies)
+        render_history_tab(config.get('strategies', {}))
     with tab4:
         render_journal_tab()
     with tab5:
         render_analytics_tab()
-
-    time.sleep(1)
-    st.rerun()
 
 if __name__ == "__main__":
     main()

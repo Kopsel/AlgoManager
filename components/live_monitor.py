@@ -10,6 +10,8 @@ from components.utils import get_strategy_name
 
 MAX_DATA_POINTS = 200
 
+# --- NEW: Isolate this entire panel so it refreshes smoothly without global reruns ---
+@st.fragment(run_every=1)
 def render_live_panel(strategies, config):
     # --- DYNAMIC TIMEZONE CONFIGURATION ---
     local_offset = config.get('system', {}).get('local_utc_offset_hours', 1)
@@ -77,7 +79,6 @@ def render_live_panel(strategies, config):
         
         db_path = config['system'].get('db_path', 'trading_system.db')
         try:
-            # --- FIX: Added timeout and WAL mode ---
             conn = sqlite3.connect(db_path, timeout=15.0)
             conn.execute("PRAGMA journal_mode=WAL;")
             
@@ -143,17 +144,14 @@ def render_live_panel(strategies, config):
         if rates is not None and len(rates) > 0:
             df_rates = pd.DataFrame(rates)
             
-            # --- TIMEZONE FIX: Sync MT5 Broker Time with System Database Time ---
             df_rates['time'] = pd.to_datetime(df_rates['time'], unit='s') - pd.Timedelta(hours=broker_offset) + pd.Timedelta(hours=local_offset)
             
             try:
                 db_path = config['system'].get('db_path', 'trading_system.db')
                 
-                # --- FIX: Added timeout and WAL mode ---
                 conn = sqlite3.connect(db_path, timeout=15.0)
                 conn.execute("PRAGMA journal_mode=WAL;")
                 
-                # Drop old data from dummy pings so it doesn't smear
                 recent_threshold = datetime.now().timestamp() - (12 * 3600) 
                 df_regimes = pd.read_sql(f"SELECT * FROM regime_history WHERE timestamp > {recent_threshold} ORDER BY timestamp DESC LIMIT 300", conn)
                 conn.close()

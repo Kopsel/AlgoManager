@@ -14,17 +14,29 @@ def safe_float(val):
     except:
         return 0.0
 
+# --- NEW: Downsampler to prevent charting lag ---
+def decimate_dataframe(df, max_points=400):
+    """Reduces the number of rows to improve rendering performance without losing the curve shape."""
+    if len(df) > max_points:
+        step = max(1, len(df) // max_points)
+        # Ensure we always keep the very last point for the most up-to-date visual
+        last_row = df.iloc[-1:]
+        df_decimated = df.iloc[::step]
+        if df_decimated.index[-1] != last_row.index[0]:
+            df_decimated = pd.concat([df_decimated, last_row])
+        return df_decimated
+    return df
+
 def render_equity_chart(df_live, key=None):
-    """
-    Renders a professional TradingView-style area chart.
-    Wraps options and series into the single list structure expected by the library.
-    """
     if df_live.empty:
         st.info("Waiting for data...")
         return
 
     # 1. Format Data for the Library
     df_live = df_live.sort_values('time_unix')
+    
+    # Decimate large datasets before rendering
+    df_live = decimate_dataframe(df_live, max_points=400)
     
     data_equity = []
     data_balance = []
@@ -34,7 +46,6 @@ def render_equity_chart(df_live, key=None):
         
         t = int(row['time_unix']) 
         
-        # FIX: Use safe_float helper
         eq_val = safe_float(row.get('Equity'))
         bal_val = safe_float(row.get('Balance'))
         
@@ -48,7 +59,7 @@ def render_equity_chart(df_live, key=None):
             "background": {"type": 'solid', "color": 'transparent'},
         },
         "grid": {
-            "vertLines": {"color": "rgba(42, 46, 57, 0)"}, # Hidden grid
+            "vertLines": {"color": "rgba(42, 46, 57, 0)"}, 
             "horzLines": {"color": "rgba(42, 46, 57, 0.6)"},
         },
         "rightPriceScale": {
@@ -79,9 +90,9 @@ def render_equity_chart(df_live, key=None):
             "type": "Line",
             "data": data_balance,
             "options": {
-                "color": "#ff9800", # Orange for Balance
+                "color": "#ff9800", 
                 "lineWidth": 2,
-                "lineStyle": 2, # Dashed
+                "lineStyle": 2, 
                 "title": "Balance"
             },
         }
@@ -96,29 +107,21 @@ def render_equity_chart(df_live, key=None):
     ], key=key)
 
 def render_drawdown_chart(df_live, key=None):
-    """
-    Renders a line chart for individual strategy floating P/L.
-    """
     if df_live.empty:
         return
 
     df_live = df_live.sort_values('time_unix')
+    df_live = decimate_dataframe(df_live, max_points=200)
     
-    # Identify PL columns dynamically
     pl_cols = [c for c in df_live.columns if c.startswith("PL_")]
-    
     series_list = []
-    # Pick distinct colors for strategies
     colors = ['#2962FF', '#E91E63', '#00E676', '#FFD600', '#AB47BC']
     
     for i, col in enumerate(pl_cols):
         data_series = []
         for _, row in df_live.iterrows():
             if pd.isna(row['time_unix']): continue
-            
-            # FIX: Use safe_float helper to catch NaNs and Infs
             val = safe_float(row.get(col))
-                
             data_series.append({"time": int(row['time_unix']), "value": val})
         
         strat_name = col.replace("PL_", "")
@@ -148,12 +151,12 @@ def render_drawdown_chart(df_live, key=None):
     ], key=key)
 
 def render_regime_chart(df):
-    """
-    Renders a Plotly candlestick chart with background colors for the AI Regime.
-    """
     if df.empty:
         st.info("Waiting for price data...")
         return
+
+    # Decimate to avoid plotting thousands of unreadable candlesticks
+    df = decimate_dataframe(df, max_points=300)
 
     # 1. Base Candlestick Chart
     fig = go.Figure(data=[go.Candlestick(
@@ -172,7 +175,6 @@ def render_regime_chart(df):
 
     # 3. Paint Background Regimes
     if 'regime' in df.columns and not df['regime'].isna().all():
-        # Create blocks of continuous regimes
         df['block'] = (df['regime'] != df['regime'].shift(1)).cumsum()
         
         for _, group in df.groupby('block'):

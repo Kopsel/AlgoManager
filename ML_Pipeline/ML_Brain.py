@@ -26,14 +26,24 @@ def load_config_and_model():
     
     current_mtime = get_file_mtime(CONFIG_FILE)
     if current_mtime > last_config_mtime:
-        with open(CONFIG_FILE, "r") as f:
-            config = json.load(f)
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                new_config = json.load(f)
+                
+            # Only update memory if the read was perfectly successful
+            config = new_config
+            last_config_mtime = current_mtime
+            print("🔄 ML Brain: Configuration Reloaded.")
             
-        last_config_mtime = current_mtime
-        print("🔄 ML Brain: Configuration Reloaded.")
-        
+        except json.JSONDecodeError:
+            # The file is currently being overwritten by the Dashboard (0 bytes).
+            # We silently ignore this and wait for the next tick.
+            pass
+        except Exception as e:
+            print(f"⚠️ Warning: Could not read config file: {e}")
+            
         # Only load the AI model once at startup
-        if ai_model is None:
+        if ai_model is None and config:
             model_path = os.path.join(BASE_DIR, config.get('ml_pipeline', {}).get('alpha_filter', {}).get('model_save_path', ''))
             if os.path.exists(model_path):
                 ai_model = xgb.XGBClassifier()

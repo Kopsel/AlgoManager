@@ -5,6 +5,7 @@ import zmq
 import pandas as pd
 import numpy as np
 import pickle
+import time
 from datetime import datetime
 
 # --- CONFIG ---
@@ -18,8 +19,21 @@ if ROOT_DIR not in sys.path:
 
 from components.database import Database
 
-with open(CONFIG_FILE, "r") as f:
-    config = json.load(f)
+# --- THE FIX: Fault-Tolerant Startup Loader ---
+print("⏳ Loading Configuration...")
+config = {}
+for attempt in range(10): # Try up to 10 times (1 second total)
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            config = json.load(f)
+        break # Success, break the loop
+    except json.JSONDecodeError:
+        print(f"⚠️ Config locked by UI (Attempt {attempt+1}/10). Retrying in 100ms...")
+        time.sleep(0.1)
+
+if not config:
+    print("❌ CRITICAL: Failed to load configuration after multiple attempts. Shutting down.")
+    sys.exit(1)
 
 REGIME_PORT = config['system'].get('zmq_regime_port', 5557)
 RF_CFG = config['ml_pipeline']['rf_classifier']

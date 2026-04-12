@@ -265,24 +265,49 @@ def check_basket_logic():
     if acc is None: return
 
     positions = mt5.positions_get()
+    
+    # --- 1. BASKET RESET LOGIC (No positions open) ---
     if positions is None or len(positions) == 0:
-        if basket_start_equity is not None:
+        # If memory or config still thinks a basket is active, clear it
+        if basket_start_equity is not None or risk.get('active_basket_anchor_usd') is not None:
             basket_start_equity = None
+            config['risk_management']['active_basket_anchor_usd'] = None
+            with open(CONFIG_FILE, "w") as f:
+                json.dump(config, f, indent=2)
+            print("Manager: 🧹 Basket cleared from memory and config.")
         return 
 
     current_equity = acc.equity
 
+    # --- 2. BASKET START OR RESUME LOGIC ---
     if basket_start_equity is None:
-        basket_start_equity = current_equity
-        print(f"Manager: 🎯 New Basket Started. Anchor Equity: ${basket_start_equity:.2f}")
+        saved_anchor = risk.get('active_basket_anchor_usd')
+        
+        if saved_anchor is not None:
+            # We just rebooted. Resume the basket from the config file!
+            basket_start_equity = saved_anchor
+            print(f"Manager: 🔄 Resumed Active Basket. Original Anchor Equity: ${basket_start_equity:.2f}")
+        else:
+            # We are genuinely starting a brand new basket.
+            basket_start_equity = current_equity
+            config['risk_management']['active_basket_anchor_usd'] = basket_start_equity
+            with open(CONFIG_FILE, "w") as f:
+                json.dump(config, f, indent=2)
+            print(f"Manager: 🎯 New Basket Started. Anchor Equity saved to config: ${basket_start_equity:.2f}")
 
+    # --- 3. BASKET TAKE PROFIT CHECK ---
     tp_limit = risk.get('basket_take_profit_usd')
     if tp_limit and tp_limit > 0:
         target_amount = basket_start_equity + tp_limit
         if current_equity >= target_amount:
             print(f"\n!!! BASKET TP HIT (Equity: ${current_equity:.2f} >= Target: ${target_amount:.2f}) !!!")
             close_all_positions(reason="Equity Target Reached")
+            
+            # Wipe the anchor clean after a successful close
             basket_start_equity = None
+            config['risk_management']['active_basket_anchor_usd'] = None
+            with open(CONFIG_FILE, "w") as f:
+                json.dump(config, f, indent=2)
 
 def execute_trade(signal_data):
     load_config()

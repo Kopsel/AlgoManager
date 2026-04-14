@@ -13,7 +13,7 @@
   },
   "risk_management": {
     "basket_enabled": true,
-    "basket_take_profit_usd": 0.5,
+    "basket_take_profit_usd": 1.0,
     "emergency_protocols": {
       "system_locked": true,
       "flash_crash_watcher": {
@@ -62,9 +62,9 @@
         "supervisor_present": true,
         "min_confidence_threshold": 0.6,
         "min_volume": 0.01,
-        "max_volume_supervised": 0.2,
+        "max_volume_supervised": 0.5,
         "max_volume_unsupervised": 0.1,
-        "curve_power": 3.0
+        "curve_power": 1.5
       },
       "xgb_params": {
         "max_depth": 4,

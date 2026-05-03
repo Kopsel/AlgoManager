@@ -5,17 +5,20 @@
     "zmq_port": 5555,
     "zmq_brain_port": 5556,
     "zmq_regime_port": 5557,
-    "mt5_terminal_path2": "E:\\FusionMarketsMT5\\terminal64.exe",
-    "mt5_terminal_path": "C:\\Program Files\\MetaTrader 5\\terminal64.exe",
+    "mt5_terminal_path": "E:\\FusionMarketsMT5\\terminal64.exe",
+    "mt5_terminal_path2": "C:\\Program Files\\MetaTrader 5\\terminal64.exe",
     "broker_utc_offset_hours": 3,
     "local_utc_offset_hours": 1,
-    "authorized_account_number": 410349
+    "authorized_account_number": 410349,
+    "symbol_mapping": {
+      "ES.M26": "US500"
+    }
   },
   "risk_management": {
     "basket_enabled": true,
-    "basket_take_profit_usd": 1.0,
+    "basket_take_profit_usd": 0.2,
     "emergency_protocols": {
-      "system_locked": true,
+      "system_locked": false,
       "flash_crash_watcher": {
         "enabled": true,
         "adr_days": 14,
@@ -27,45 +30,49 @@
         "flatten_minutes_before_tier1": 5
       },
       "saved_sl_tp": {}
-    }
+    },
+    "grid_recovery": {
+      "activation_timer_minutes": 8.0,
+      "basket_tp_points": 1.0,
+      "regime_alignment": {
+        "allow_long_grids_in": [
+          0,
+          1
+        ],
+        "allow_short_grids_in": [
+          2,
+          1
+        ]
+      },
+      "continuous_scaling": {
+        "baseline_confidence": 0.5,
+        "max_confidence": 1.0,
+        "atr_period": 14,
+        "atr_timeframe": "M5",
+        "min_atr_multiplier": 0.5,
+        "max_atr_multiplier": 2.0,
+        "fallback_step_points": 3.0
+      }
+    },
+    "active_basket_anchor_usd": 6.08
   },
   "strategies": {
     "QT_Velocity": {
       "enabled": true,
-      "magic_number": 33333,
-      "symbol": "US500",
+      "magic_number": 1001,
+      "symbol": "ES.M26",
       "volume": 0.01,
       "trade_limits": {
-        "sl_points": 0,
         "tp_points": 1.0
       }
     }
   },
   "ml_pipeline": {
-    "regime_mapping": {
-      "bull_longs_only": 0,
-      "chop_bidirectional": 1,
-      "bear_shorts_only": 2
-    },
-    "_comment_labeling": "Horizon is minutes to wait. Spread allowance forces trade to clear the bid/ask spread.",
-    "labeling": {
-      "horizon_minutes": 10,
-      "spread_allowance": 0.3
-    },
-    "_comment_alpha_filter": "Subsample and colsample prevent overfitting. Scale_pos_weight punishes the AI for missing losses.",
     "alpha_filter": {
+      "min_entry_confidence": 0.5,
       "json_column_name": "features_json",
       "model_save_path": "ML_Pipeline/alpha_filter_v1.json",
       "train_test_split": 0.8,
-      "dynamic_sizing": {
-        "enabled": true,
-        "supervisor_present": true,
-        "min_confidence_threshold": 0.6,
-        "min_volume": 0.01,
-        "max_volume_supervised": 0.5,
-        "max_volume_unsupervised": 0.1,
-        "curve_power": 1.5
-      },
       "xgb_params": {
         "max_depth": 4,
         "learning_rate": 0.05,
@@ -82,6 +89,11 @@
       "n_components": 5,
       "random_state": 42,
       "model_save_path": "ML_Pipeline/hmm_model.pkl"
+    },
+    "regime_mapping": {
+      "bull_longs_only": 0,
+      "chop_bidirectional": 1,
+      "bear_shorts_only": 2
     },
     "rf_classifier": {
       "enabled": true,
@@ -100,6 +112,10 @@
         "Size_Imbalance",
         "Delta_Percent"
       ]
+    },
+    "labeling": {
+      "horizon_minutes": 8,
+      "spread_allowance": 0.3
     }
   }
 }

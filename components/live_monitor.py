@@ -4,6 +4,7 @@ import numpy as np
 import MetaTrader5 as mt5
 import json
 import sqlite3
+import time
 from datetime import datetime, timedelta
 from components.charts import render_equity_chart, render_drawdown_chart, render_regime_chart
 from components.utils import get_strategy_name
@@ -49,10 +50,14 @@ def render_live_panel(strategies, config):
                     strat_live_data[strat_name]['net_lots'] -= pos.volume
                     strat_live_data[strat_name]['net_count'] -= 1
 
-    # --- SAVE SNAPSHOT ---
-    now = datetime.now() + timedelta(hours=local_offset)
-    timestamp_str = now.strftime('%H:%M:%S')
-    timestamp_unix = now.timestamp()
+    # --- SAVE SNAPSHOT (FIXED TIMEZONE LOGIC) ---
+    # 1. Grab the absolute, unambiguous UNIX epoch for the chart's X-axis
+    timestamp_unix = time.time() 
+    
+    # 2. Grab the visual string applying your custom JSON offset
+    now_utc = datetime.utcnow()
+    now_local = now_utc + timedelta(hours=local_offset)
+    timestamp_str = now_local.strftime('%H:%M:%S')
     
     snapshot = {
         'time': timestamp_str,
@@ -138,12 +143,18 @@ def render_live_panel(strategies, config):
             
     with c2:
         st.subheader("Live Market Regime (SPX)")
-        symbol = config.get('strategies', {}).get('QT_Velocity', {}).get('symbol', 'US500')
-        rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, 100)
+        qt_symbol = config.get('strategies', {}).get('QT_Velocity', {}).get('symbol', 'ES.M26')
+        
+        # --- APPLY THE MT5 SYMBOL MAPPING ---
+        symbol_map = config.get('system', {}).get('symbol_mapping', {})
+        mt5_symbol = symbol_map.get(qt_symbol, qt_symbol)
+        
+        rates = mt5.copy_rates_from_pos(mt5_symbol, mt5.TIMEFRAME_M1, 0, 100)
         
         if rates is not None and len(rates) > 0:
             df_rates = pd.DataFrame(rates)
             
+            # --- ALIGN MT5 BROKER TIME WITH LOCAL TIME ---
             df_rates['time'] = pd.to_datetime(df_rates['time'], unit='s') - pd.Timedelta(hours=broker_offset) + pd.Timedelta(hours=local_offset)
             
             try:
@@ -152,11 +163,13 @@ def render_live_panel(strategies, config):
                 conn = sqlite3.connect(db_path, timeout=15.0)
                 conn.execute("PRAGMA journal_mode=WAL;")
                 
-                recent_threshold = datetime.now().timestamp() - (12 * 3600) 
+                # Fetch recent regimes
+                recent_threshold = datetime.utcnow().timestamp() - (12 * 3600) 
                 df_regimes = pd.read_sql(f"SELECT * FROM regime_history WHERE timestamp > {recent_threshold} ORDER BY timestamp DESC LIMIT 300", conn)
                 conn.close()
                 
                 if not df_regimes.empty:
+                    # Align DB standard UTC time with Local Time
                     df_regimes['time'] = pd.to_datetime(df_regimes['timestamp'], unit='s') + timedelta(hours=local_offset)
                     
                     df_rates = df_rates.sort_values('time')
@@ -169,6 +182,11 @@ def render_live_panel(strategies, config):
                         direction='backward',
                         tolerance=pd.Timedelta('10m') 
                     )
+                    
+                    # --- INSTANT LIVE CANDLE OVERWRITE ---
+                    latest_live_regime = df_regimes['regime'].iloc[-1]
+                    df_chart.loc[df_chart.index[-1], 'regime'] = latest_live_regime
+                    
                 else:
                     df_chart = df_rates
                     df_chart['regime'] = np.nan
@@ -179,7 +197,7 @@ def render_live_panel(strategies, config):
             from components.charts import render_regime_chart
             render_regime_chart(df_chart)
         else:
-            st.info(f"Waiting for MT5 price data for {symbol}...")
+            st.info(f"Waiting for MT5 price data for {mt5_symbol}...")
 
     st.subheader("Full Session Performance")
     df_full = pd.DataFrame(st.session_state.session_full_history)
@@ -193,8 +211,9 @@ def render_live_panel(strategies, config):
     # --- SCORECARD TABLE ---
     st.subheader("Strategy Scorecard (Session)")
     
-    from_date = datetime.now() - timedelta(days=3)
-    to_date = datetime.now() + timedelta(days=1)
+    # We fetch deals from -3 days to capture active overnight sessions
+    from_date = datetime.utcnow() - timedelta(days=3)
+    to_date = datetime.utcnow() + timedelta(days=1)
     history = mt5.history_deals_get(from_date, to_date)
     
     position_magic_map = {}
@@ -215,7 +234,8 @@ def render_live_panel(strategies, config):
         if history:
             deals = []
             for d in history:
-                if d.entry in [1, 2] and d.ticket > st.session_state.reset_ticket_threshold:
+                # Filter strictly for closing deals that happened after the session threshold
+                if d.entry in [1, 2] and d.ticket > st.session_state.get('reset_ticket_threshold', 0):
                     original_magic = position_magic_map.get(d.position_id, d.magic)
                     if original_magic == target_magic:
                         deals.append(d)

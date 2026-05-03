@@ -30,66 +30,38 @@ def load_config_and_model():
             with open(CONFIG_FILE, "r") as f:
                 new_config = json.load(f)
                 
-            # Only update memory if the read was perfectly successful
             config = new_config
             last_config_mtime = current_mtime
             print("🔄 ML Brain: Configuration Reloaded.")
             
         except json.JSONDecodeError:
-            # The file is currently being overwritten by the Dashboard (0 bytes).
-            # We silently ignore this and wait for the next tick.
             pass
         except Exception as e:
             print(f"⚠️ Warning: Could not read config file: {e}")
             
-        # Only load the AI model once at startup
         if ai_model is None and config:
             model_path = os.path.join(BASE_DIR, config.get('ml_pipeline', {}).get('alpha_filter', {}).get('model_save_path', ''))
             if os.path.exists(model_path):
                 ai_model = xgb.XGBClassifier()
                 ai_model.load_model(model_path)
                 print(f"🧠 AI Alpha Filter Loaded from {model_path}")
-            else:
-                print("⚠️ Warning: AI Model not found. Filtering will be disabled.")
-
-def calculate_dynamic_size(confidence):
-    ml_settings = config['ml_pipeline']['alpha_filter']['dynamic_sizing']
-    if not ml_settings['enabled']:
-        return None 
-        
-    min_conf = ml_settings['min_confidence_threshold']
-    min_vol = ml_settings['min_volume']
-    
-    # --- UPGRADE: SUPERVISOR TOGGLE LOGIC ---
-    supervisor_present = ml_settings.get('supervisor_present', False)
-    if supervisor_present:
-        max_vol = ml_settings.get('max_volume_supervised', 0.5)
-    else:
-        max_vol = ml_settings.get('max_volume_unsupervised', 0.1)
-        
-    power = ml_settings.get('curve_power', 2.0)
-    
-    if confidence < min_conf:
-        return 0.0  
-        
-    linear_scale = (confidence - min_conf) / (1.0 - min_conf)
-    top_heavy_scale = linear_scale ** power
-    volume = min_vol + (top_heavy_scale * (max_vol - min_vol))
-    return float(round(volume, 2))
 
 def process_qt_velocity(payload):
     # --- EMERGENCY SYSTEM LOCK CHECK ---
     risk_cfg = config.get('risk_management', {}).get('emergency_protocols', {})
     if risk_cfg.get('system_locked', False): 
         action = "BUY" if payload.get('trigger', {}).get('speed_delta', 0) < 0 else "SELL"
-        return action, {"confidence": 0.0}, 0.0, True # Force the block
+        return action, {"confidence": 0.0}, 0.0, True
         
     trigger = payload.get('trigger', {})
+    
+    # NEW: Pull the fixed volume directly from the strategy config
+    fixed_volume = config.get('strategies', {}).get('QT_Velocity', {}).get('volume', 0.01)
     
     if ai_model is None:
         speed = trigger.get('speed_delta', 0)
         action = "BUY" if speed < 0 else "SELL"
-        return action, {"confidence": 0.0, "speed": speed}, None, False
+        return action, {"confidence": 0.0, "speed": speed}, fixed_volume, False
         
     context_data = payload['context']
     temporal = payload['temporal']
@@ -97,6 +69,18 @@ def process_qt_velocity(payload):
     
     action = "BUY" if trigger['speed_delta'] < 0 else "SELL"
     is_buy = 1 if action == "BUY" else 0
+    
+    # --- TIER 1: FRONT DOOR REGIME FILTER ---
+    regime = int(context_data.get('macro_regime_state', 1))
+    regime_blocked = False
+    
+    if regime == 0 and action == "SELL":
+        regime_blocked = True
+        print("🔭 WATCHTOWER: Regime 0 (Bull) -> Blocked counter-trend SELL")
+    elif regime == 2 and action == "BUY":
+        regime_blocked = True
+        print("🔭 WATCHTOWER: Regime 2 (Bear) -> Blocked counter-trend BUY")
+    # ----------------------------------------
     
     bids = dom['bid_sizes']
     asks = dom['ask_sizes']
@@ -106,16 +90,6 @@ def process_qt_velocity(payload):
     dom_features = {}
     for i, b in enumerate(bids): dom_features[f'bid_norm_{i}'] = b / total_liq
     for i, a in enumerate(asks): dom_features[f'ask_norm_{i}'] = a / total_liq
-
-    regime = context_data.get('macro_regime_state', 1) 
-    regime_blocked = False
-    
-    if regime == 0 and action == "SELL":
-        regime_blocked = True
-        print("🔭 WATCHTOWER: Regime 0 (Longs Only) -> Blocked counter-trend SELL")
-    elif regime == 2 and action == "BUY":
-        regime_blocked = True
-        print("🔭 WATCHTOWER: Regime 2 (Shorts Only) -> Blocked counter-trend BUY")
 
     feature_dict = {
         **trigger, **context_data, 
@@ -131,45 +105,38 @@ def process_qt_velocity(payload):
     probabilities = ai_model.predict_proba(df_live)
     win_confidence = probabilities[0][1]
     
-    volume = calculate_dynamic_size(win_confidence)
-    ai_blocked = volume == 0.0
-    
-    final_blocked = ai_blocked or regime_blocked
-    
     custom_metrics = {
         "confidence": float(win_confidence),
         "speed": trigger.get('speed_delta', 0),
         "absorption": trigger.get('absorption_ratio', 0),
-        "macro_regime": int(regime)
+        "macro_regime": regime,
+        "pa_5m_range": float(context_data.get('pa_5m_range', 0.0))
     }
-    
-    return action, custom_metrics, volume, final_blocked
 
-def process_qt_trend(payload):
-    # --- EMERGENCY SYSTEM LOCK CHECK ---
-    risk_cfg = config.get('risk_management', {}).get('emergency_protocols', {})
-    if risk_cfg.get('system_locked', False): 
-        return "BUY", {}, None, True # Force the block
-        
-    return "BUY", {}, None, False
+    # --- DYNAMIC AI CONFIDENCE FILTER ---
+    min_conf = config.get('ml_pipeline', {}).get('alpha_filter', {}).get('min_entry_confidence', 0.60)
+    ai_blocked = win_confidence < min_conf
+    
+    final_blocked = ai_blocked or regime_blocked
+    
+    return action, custom_metrics, fixed_volume, final_blocked
 
 def run_ml_brain():
-    print("🧠 Starting ML Router Brain (HFT & Stacking Optimized)...")
-    load_config_and_model() # Initial load
+    print("🧠 Starting ML Router Brain (Fixed Sizing + Dynamic Threshold)...")
+    load_config_and_model() 
     db = Database()
     context = zmq.Context()
     
     receiver_socket = context.socket(zmq.REP)
-    receiver_socket.bind("tcp://*:5556")
+    receiver_socket.bind(f"tcp://*:{config['system']['zmq_brain_port']}")
     
     manager_socket = context.socket(zmq.REQ)
-    manager_socket.connect("tcp://localhost:5555")
+    manager_socket.connect(f"tcp://localhost:{config['system']['zmq_port']}")
 
     print("✅ Listening to Quantower | Connected to MT5 Manager")
 
     try:
         while True:
-            # --- HOT RELOAD CHECK ---
             load_config_and_model() 
             
             message = receiver_socket.recv_string()
@@ -182,8 +149,6 @@ def run_ml_brain():
             
             if strategy_id == "QT_Velocity":
                 action, custom_metrics, volume, final_blocked = process_qt_velocity(payload)
-            elif strategy_id == "QT_Trend":
-                action, custom_metrics, volume, final_blocked = process_qt_trend(payload)
             else:
                 continue
 

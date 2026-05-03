@@ -24,26 +24,22 @@ XGB_PARAMS = ML_CONFIG['xgb_params']
 def load_data():
     conn = sqlite3.connect(DB_PATH)
     
-    # --- FIXED: ID-Based Hard Join ---
-    # We ignore 'target_label' and calculate the true win/loss from the actual trades table
-    trades_query = "SELECT ml_feature_id, pnl FROM trades WHERE ml_feature_id IS NOT NULL"
-    df_trades = pd.read_sql(trades_query, conn)
-    
-    ml_query = "SELECT id, features_json FROM ml_features"
-    df_ml = pd.read_sql(ml_query, conn)
+    # --- THE FIX: STRICT NIGHT SHIFT BOUNDARY ---
+    # We completely ignore the 'trades' table to prevent Survivorship Bias.
+    # We only use the strict 8-minute target_label from the Night Shift Labeler.
+    query = """
+        SELECT id, features_json, target_label as target 
+        FROM ml_features 
+        WHERE target_label IS NOT NULL
+    """
+    df = pd.read_sql(query, conn)
     conn.close()
 
-    if df_trades.empty or df_ml.empty:
+    if df.empty:
         return None
 
-    # This Inner Join is 100% immune to Timezone bugs
-    df_merged = pd.merge(df_trades, df_ml, left_on='ml_feature_id', right_on='id', how='inner')
-    
-    # Calculate truth target: 1 if trade made money, 0 if it lost
-    df_merged['target'] = (df_merged['pnl'] > 0).astype(int)
-
     features_list = []
-    for index, row in df_merged.iterrows():
+    for index, row in df.iterrows():
         try:
             data = json.loads(row[JSON_COLUMN_NAME])
             feature_row = {**data.get('trigger', {}), **data.get('context', {})}

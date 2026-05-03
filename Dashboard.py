@@ -20,33 +20,6 @@ st.set_page_config(page_title="Algo Command", layout="wide")
 _cfg_init = load_config()
 LOCAL_OFFSET = _cfg_init.get('system', {}).get('local_utc_offset_hours', 1) if _cfg_init else 1
 
-def update_supervisor_mode(new_state):
-    config_path = 'system_config.json' 
-    try:
-        with open(config_path, 'r') as f:
-            cfg = json.load(f)
-            
-        sizing_ref = cfg['ml_pipeline']['alpha_filter']['dynamic_sizing']
-        
-        if 'supervisor_present' not in sizing_ref:
-            sizing_ref['max_volume_supervised'] = 0.5
-            sizing_ref['max_volume_unsupervised'] = 0.1
-            
-        sizing_ref['supervisor_present'] = new_state
-        
-        with open(config_path, 'w') as f:
-            json.dump(cfg, f, indent=2)
-            
-        return True
-    except Exception as e:
-        st.sidebar.error(f"Failed to update config: {e}")
-        return False
-
-def on_supervisor_toggle():
-    new_state = st.session_state.supervisor_switch
-    if update_supervisor_mode(new_state):
-        st.toast(f"Supervisor Mode {'ACTIVATED (0.5L)' if new_state else 'DEACTIVATED (0.1L)'}!")
-
 # --- NEW: SYSTEM LOCK & HEDGE LOGIC ---
 def toggle_system_lock_and_hedge(new_state):
     config_path = 'system_config.json'
@@ -192,14 +165,20 @@ if 'data_restored' not in st.session_state:
             if 'timestamp' in d:
                 try:
                     ts_pandas = pd.to_datetime(d['timestamp'])
-                    ts_python = ts_pandas.to_pydatetime() + timedelta(hours=LOCAL_OFFSET)
-                    t_unix = ts_python.timestamp()
+                    
+                    # --- FIX: PROPER TIMEZONE EXTRACTION ---
+                    # Keep UNIX timestamp strictly UTC to satisfy the charting library
+                    ts_python_utc = ts_pandas.to_pydatetime() 
+                    t_unix = ts_python_utc.timestamp()
                     
                     if t_unix < midnight_timestamp:
                         continue 
                     
                     clean_row['time_unix'] = t_unix
-                    clean_row['time'] = ts_python.strftime('%H:%M:%S')
+                    
+                    # Apply local offset ONLY to the visual text label
+                    ts_local = ts_python_utc + timedelta(hours=LOCAL_OFFSET)
+                    clean_row['time'] = ts_local.strftime('%H:%M:%S')
                 except Exception:
                     continue 
             
@@ -314,19 +293,6 @@ def main():
             key="system_lock_switch", 
             on_change=on_system_lock_toggle, 
             help="ON: Trading Suspended. OFF: Trading Active. Watcher can auto-trigger this."
-        )
-
-        sizing_cfg = config.get('ml_pipeline', {}).get('alpha_filter', {}).get('dynamic_sizing', {})
-        current_supervisor_state = sizing_cfg.get('supervisor_present', False)
-        
-        if 'supervisor_switch' not in st.session_state:
-            st.session_state.supervisor_switch = current_supervisor_state
-            
-        st.toggle(
-            "👁️ Supervisor Mode", 
-            key="supervisor_switch", 
-            on_change=on_supervisor_toggle, 
-            help="ON: Allows up to 0.5 Lots. OFF: Throttles AI to 0.1 Lots."
         )
         
         st.divider()

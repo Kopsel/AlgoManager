@@ -58,7 +58,7 @@ def load_config():
                     if 'system' in new_config and 'strategies' in new_config:
                         config = new_config
                         last_config_mtime = current_mtime
-                        print("Manager: Configuration Loaded.")
+                        # print("Manager: Configuration Loaded.") <-- SILENCED SPAM
                         return True
             except Exception as e:
                 time.sleep(0.05)
@@ -294,6 +294,165 @@ def check_basket_logic():
             with open(CONFIG_FILE, "w") as f:
                 json.dump(config, f, indent=2)
 
+def manage_grids():
+    """Handles the 8-Minute Pivot, Regime Freezing, and Continuous DCA Averaging"""
+    
+    # 1. Check for Emergency Locks
+    risk_cfg = config.get('risk_management', {}).get('emergency_protocols', {})
+    if risk_cfg.get('system_locked', False): 
+        return 
+
+    grid_cfg = config.get('risk_management', {}).get('grid_recovery')
+    if not grid_cfg: return
+    
+    positions = mt5.positions_get()
+    if not positions: return
+    
+    longs = [p for p in positions if p.type == mt5.POSITION_TYPE_BUY]
+    shorts = [p for p in positions if p.type == mt5.POSITION_TYPE_SELL]
+    
+    # =================================================================
+    # 🛡️ THE TIER 2 REGIME FILTER (LIVE DATABASE LOOKUP)
+    # =================================================================
+    try:
+        latest_regimes = db.fetch_regimes(limit=1)
+        # If DB has data, use the newest regime. If not, default to 1 (Chop).
+        current_live_regime = latest_regimes[0]['regime'] if latest_regimes else 1 
+    except Exception as e:
+        print(f"Manager: DB Regime Fetch Failed ({e}). Defaulting to Chop (1).")
+        current_live_regime = 1 
+    # =================================================================
+
+    def process_basket(basket_positions, direction):
+        if not basket_positions: return
+        anchor = min(basket_positions, key=lambda p: p.time)
+        
+        symbol = anchor.symbol
+        tick = mt5.symbol_info_tick(symbol)
+        if not tick: return
+        
+        # Synchronize with MT5 Broker time to prevent Timezone Bugs
+        broker_now = tick.time
+        time_open_mins = (broker_now - anchor.time) / 60.0
+        
+        # 1. Has the initial scalp expired?
+        if time_open_mins >= grid_cfg['activation_timer_minutes']:
+            meta = trade_metadata.get(anchor.ticket, {})
+            
+            # =================================================================
+            # 🛑 APPLY THE REGIME FREEZE LOGIC
+            # =================================================================
+            aligned = False
+            if direction == "LONG" and current_live_regime in grid_cfg['regime_alignment']['allow_long_grids_in']: 
+                aligned = True
+            if direction == "SHORT" and current_live_regime in grid_cfg['regime_alignment']['allow_short_grids_in']: 
+                aligned = True
+            
+            if not aligned:
+                # The live regime contradicts our basket direction. 
+                # We return immediately, freezing the grid to protect equity.
+                return 
+            # =================================================================
+
+            # 3. Dynamic Volatility Math (ATR x Confidence)
+            conf = meta.get('confidence', 0.50)
+            scale_cfg = grid_cfg['continuous_scaling']
+            
+            # Clamp confidence and calculate ratio
+            conf_clamped = max(scale_cfg['baseline_confidence'], min(scale_cfg['max_confidence'], conf))
+            ratio = (conf_clamped - scale_cfg['baseline_confidence']) / (scale_cfg['max_confidence'] - scale_cfg['baseline_confidence'])
+            
+            # Fetch Live MT5 Candles for ATR
+            atr_period = scale_cfg.get('atr_period', 14)
+            tf_map = {"M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5, "M15": mt5.TIMEFRAME_M15}
+            tf = tf_map.get(scale_cfg.get('atr_timeframe', 'M5'), mt5.TIMEFRAME_M5)
+            
+            rates = mt5.copy_rates_from_pos(symbol, tf, 0, atr_period + 1)
+            atr_val = scale_cfg.get('fallback_step_points', 3.0)
+            
+            if rates is not None and len(rates) >= atr_period + 1:
+                highs = [r[2] for r in rates]
+                lows = [r[3] for r in rates]
+                closes = [r[4] for r in rates]
+                
+                tr_list = []
+                for i in range(1, len(rates)):
+                    hl = highs[i] - lows[i]
+                    hc = abs(highs[i] - closes[i-1])
+                    lc = abs(lows[i] - closes[i-1])
+                    tr_list.append(max(hl, hc, lc))
+                
+                atr_val = sum(tr_list[-atr_period:]) / atr_period
+
+            # Apply Confidence Multiplier to ATR
+            min_mult = scale_cfg.get('min_atr_multiplier', 0.5)
+            max_mult = scale_cfg.get('max_atr_multiplier', 2.0)
+            
+            multiplier = min_mult + ratio * (max_mult - min_mult)
+            step_pts = atr_val * multiplier
+            
+            # Calculate extreme open price to measure step distance
+            if direction == "LONG":
+                worst_price = min(p.price_open for p in basket_positions)
+                should_add = tick.ask <= (worst_price - step_pts)
+            else:
+                worst_price = max(p.price_open for p in basket_positions)
+                should_add = tick.bid >= (worst_price + step_pts)
+            
+            # 4. Execute Grid Step (Using strict fixed anchor volume)
+            if should_add:
+                fixed_vol = anchor.volume 
+                
+                req = {
+                    "action": mt5.TRADE_ACTION_DEAL,
+                    "symbol": symbol,
+                    "volume": fixed_vol,
+                    "type": mt5.ORDER_TYPE_BUY if direction == "LONG" else mt5.ORDER_TYPE_SELL,
+                    "price": tick.ask if direction == "LONG" else tick.bid,
+                    "magic": anchor.magic,
+                    "comment": f"Grid ({step_pts:.1f}pt)",
+                    "type_time": mt5.ORDER_TIME_GTC,
+                    "type_filling": mt5.ORDER_FILLING_IOC,
+                }
+                
+                res = mt5.order_send(req)
+                if res.retcode == mt5.TRADE_RETCODE_DONE:
+                    new_ticket = res.order
+                    print(f"🕸️ GRID ADDED: {direction} | Conf: {conf:.2f} | Step: {step_pts:.1f} | Vol: {fixed_vol}")
+                    
+                    # --- THE FIX: TRACK THE NEW GRID BULLET ---
+                    # 1. Figure out which strategy this belongs to
+                    strat_id = tracked_tickets.get(anchor.ticket, str(anchor.magic))
+                    
+                    # 2. Add it to the tracking loops
+                    tracked_tickets[new_ticket] = strat_id
+                    trade_mfe_mae[new_ticket] = {'mfe': 0.0, 'mae': 0.0}
+                    
+                    # 3. Inherit the anchor's metadata (this passes down the ml_feature_id!)
+                    trade_metadata[new_ticket] = meta.copy()
+                    trade_metadata[new_ticket]['sl_price_memory'] = 0.0 # Grids don't use hard SLs
+                    trade_metadata[new_ticket]['tp_price_memory'] = 0.0 # TP is managed by the basket loop
+                    
+                    save_trade_memory()
+                    # ------------------------------------------
+                    
+            # 5. Update Basket TP (Remove SLs)
+            total_vol = sum(p.volume for p in basket_positions)
+            if total_vol > 0:
+                avg_price = sum(p.price_open * p.volume for p in basket_positions) / total_vol
+                target_tp = avg_price + grid_cfg['basket_tp_points'] if direction == "LONG" else avg_price - grid_cfg['basket_tp_points']
+                target_tp = round(target_tp, mt5.symbol_info(symbol).digits)
+                
+                for p in basket_positions:
+                    if abs(p.tp - target_tp) > 0.01 or p.sl != 0.0:
+                        mt5.order_send({
+                            "action": mt5.TRADE_ACTION_SLTP, "position": p.ticket, "symbol": symbol,
+                            "tp": target_tp, "sl": 0.0 
+                        })
+
+    process_basket(longs, "LONG")
+    process_basket(shorts, "SHORT")
+
 def execute_trade(signal_data):
     load_config()
     
@@ -302,6 +461,21 @@ def execute_trade(signal_data):
     if risk_cfg.get('system_locked', False): 
         return "Manager: REJECTED (Emergency System Lock Active)"
         
+    # --- FIX: TRANSLATE QUANTOWER SYMBOL TO MT5 SYMBOL ---
+    qt_symbol = signal_data['symbol']
+    sys_cfg = config.get('system', {})
+    symbol = sys_cfg.get('symbol_mapping', {}).get(qt_symbol, qt_symbol)
+
+    action = signal_data['action']
+
+    # --- CONCURRENCY HEDGE CHECK ---
+    positions = mt5.positions_get(symbol=symbol)
+    if positions:
+        if action == "BUY" and any(p.type == mt5.POSITION_TYPE_BUY for p in positions):
+            return "Manager: REJECTED (Long Basket Active)"
+        if action == "SELL" and any(p.type == mt5.POSITION_TYPE_SELL for p in positions):
+            return "Manager: REJECTED (Short Basket Active)"
+
     strategies = config.get('strategies', {})
     strat_id = signal_data['strategy_id']
     if strat_id not in strategies: return "Manager: Unknown Strategy"
@@ -309,8 +483,6 @@ def execute_trade(signal_data):
     settings = strategies[strat_id]
     if not settings['enabled']: return "Manager: Strategy Disabled"
     
-    symbol = settings.get('symbol', signal_data['symbol'])
-    action = signal_data['action']
     magic = settings['magic_number']
     volume = round(float(signal_data.get('volume', settings['volume'])), 2)
     
@@ -322,13 +494,11 @@ def execute_trade(signal_data):
     tick = mt5.symbol_info_tick(symbol)
     if not sym_info or not tick: return "Manager: No Data"
     
-    # --- PROPER MT5 NORMALIZATION MATH ---
     digits = sym_info.digits
     tick_size = sym_info.trade_tick_size
     if tick_size == 0: tick_size = sym_info.point # Fallback
     
     def norm_price(raw_p):
-        """Forces Python floats into strict MT5 legal broker steps"""
         return round(round(raw_p / tick_size) * tick_size, digits)
     
     order_type = mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL
@@ -351,7 +521,7 @@ def execute_trade(signal_data):
     if result.retcode != mt5.TRADE_RETCODE_DONE: 
         return f"Manager: Failed ({result.comment})"
     
-    # --- 2. THE UPGRADED BULLDOZER RETRY LOOP ---
+    # --- 2. THE UPGRADED BULDOZER RETRY LOOP ---
     tp_anchored = False
     actual_fill_price = result.price 
     sl_price = 0.0
@@ -396,57 +566,23 @@ def execute_trade(signal_data):
                 sym_info_live = mt5.symbol_info(symbol)
                 
                 if tick_now and sym_info_live:
-                    # Calculate the broker's absolute minimum distance allowed
                     min_dist = max((tick_now.ask - tick_now.bid), (sym_info_live.trade_stops_level * sym_info_live.point))
                     
-                    # --- PROXIMITY TRAP CHECK ---
-                    # Is the market too close to the TP to legally place the order?
                     if action == "BUY" and tp_price > 0 and tick_now.bid >= (tp_price - min_dist):
-                        print(f"🚀 PROXIMITY PROFIT: Market ({tick_now.bid}) is too close to TP ({tp_price}) to anchor. Closing immediately.")
-                        close_req = {
-                            "action": mt5.TRADE_ACTION_DEAL,
-                            "position": result.order,
-                            "symbol": symbol,
-                            "volume": pos_check[0].volume,
-                            "type": mt5.ORDER_TYPE_SELL,
-                            "price": tick_now.bid,
-                            "magic": magic,
-                            "comment": "Proximity TP Close",
-                        }
-                        mt5.order_send(close_req)
+                        print(f"🚀 PROXIMITY PROFIT: Closing immediately.")
+                        mt5.order_send({"action": mt5.TRADE_ACTION_DEAL, "position": result.order, "symbol": symbol, "volume": pos_check[0].volume, "type": mt5.ORDER_TYPE_SELL, "price": tick_now.bid, "magic": magic, "comment": "Proximity TP Close"})
                         tp_anchored = True
                         break
                         
                     elif action == "SELL" and tp_price > 0 and tick_now.ask <= (tp_price + min_dist):
-                        print(f"🚀 PROXIMITY PROFIT: Market ({tick_now.ask}) is too close to TP ({tp_price}) to anchor. Closing immediately.")
-                        close_req = {
-                            "action": mt5.TRADE_ACTION_DEAL,
-                            "position": result.order,
-                            "symbol": symbol,
-                            "volume": pos_check[0].volume,
-                            "type": mt5.ORDER_TYPE_BUY,
-                            "price": tick_now.ask,
-                            "magic": magic,
-                            "comment": "Proximity TP Close",
-                        }
-                        mt5.order_send(close_req)
+                        print(f"🚀 PROXIMITY PROFIT: Closing immediately.")
+                        mt5.order_send({"action": mt5.TRADE_ACTION_DEAL, "position": result.order, "symbol": symbol, "volume": pos_check[0].volume, "type": mt5.ORDER_TYPE_BUY, "price": tick_now.ask, "magic": magic, "comment": "Proximity TP Close"})
                         tp_anchored = True
                         break
                         
-                    # Also check if it's trapped against the Stop Loss
                     elif sl_price > 0 and ((action == "BUY" and tick_now.bid <= (sl_price + min_dist)) or (action == "SELL" and tick_now.ask >= (sl_price - min_dist))):
-                        print(f"💥 PROXIMITY STOP: Market fell too close to SL ({sl_price}). Closing immediately to protect equity.")
-                        close_req = {
-                            "action": mt5.TRADE_ACTION_DEAL,
-                            "position": result.order,
-                            "symbol": symbol,
-                            "volume": pos_check[0].volume,
-                            "type": mt5.ORDER_TYPE_SELL if action == "BUY" else mt5.ORDER_TYPE_BUY,
-                            "price": tick_now.bid if action == "BUY" else tick_now.ask,
-                            "magic": magic,
-                            "comment": "Proximity SL Close",
-                        }
-                        mt5.order_send(close_req)
+                        print(f"💥 PROXIMITY STOP: Closing immediately to protect equity.")
+                        mt5.order_send({"action": mt5.TRADE_ACTION_DEAL, "position": result.order, "symbol": symbol, "volume": pos_check[0].volume, "type": mt5.ORDER_TYPE_SELL if action == "BUY" else mt5.ORDER_TYPE_BUY, "price": tick_now.bid if action == "BUY" else tick_now.ask, "magic": magic, "comment": "Proximity SL Close"})
                         tp_anchored = True
                         break
                         
@@ -502,6 +638,7 @@ def run_manager():
             update_mfe_mae() 
             check_closed_trades()
             check_basket_logic()
+            manage_grids() 
             record_equity_snapshot()
             time.sleep(0.01)
 

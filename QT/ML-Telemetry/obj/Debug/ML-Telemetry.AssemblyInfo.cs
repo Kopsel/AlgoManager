@@ -14,7 +14,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("ML_Telemetry")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+44a04b57c02a3016f1297a544f4b99c8fa01e978")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+561687c8b51074253d862dba74a2560f37c1edde")]
 [assembly: System.Reflection.AssemblyProductAttribute("ML_Telemetry")]
 [assembly: System.Reflection.AssemblyTitleAttribute("ML_Telemetry")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

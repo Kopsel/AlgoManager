@@ -33,7 +33,8 @@ def render_equity_chart(df_live, key=None):
         return
 
     # 1. Format Data for the Library
-    df_live = df_live.sort_values('time_unix')
+    # FIX: Force strict chronological order and remove exact duplicates to stop the flickering
+    df_live = df_live.sort_values('time_unix').drop_duplicates(subset=['time_unix'], keep='last')
     
     # Decimate large datasets before rendering
     df_live = decimate_dataframe(df_live, max_points=400)
@@ -110,7 +111,8 @@ def render_drawdown_chart(df_live, key=None):
     if df_live.empty:
         return
 
-    df_live = df_live.sort_values('time_unix')
+    # FIX: Force strict chronological order
+    df_live = df_live.sort_values('time_unix').drop_duplicates(subset=['time_unix'], keep='last')
     df_live = decimate_dataframe(df_live, max_points=200)
     
     pl_cols = [c for c in df_live.columns if c.startswith("PL_")]

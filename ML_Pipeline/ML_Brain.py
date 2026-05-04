@@ -117,7 +117,7 @@ def process_qt_velocity(payload):
     min_conf = config.get('ml_pipeline', {}).get('alpha_filter', {}).get('min_entry_confidence', 0.60)
     ai_blocked = win_confidence < min_conf
     
-    final_blocked = ai_blocked or regime_blocked
+    final_blocked = bool(ai_blocked or regime_blocked)
     
     return action, custom_metrics, fixed_volume, final_blocked
 

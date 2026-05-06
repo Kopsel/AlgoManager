@@ -53,8 +53,7 @@
         "max_atr_multiplier": 3.0,
         "fallback_step_points": 3.0
       }
-    },
-    "active_basket_anchor_usd": 5.00
+    }
   },
   "strategies": {
     "QT_Velocity": {

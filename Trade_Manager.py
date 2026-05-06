@@ -12,6 +12,7 @@ from components.database import Database
 
 # --- CONFIG & STATE ---
 CONFIG_FILE = "system_config.json"
+MEMORY_FILE = "trade_memory.json"
 last_config_mtime = 0
 config = {} 
 last_snapshot_time = 0
@@ -65,6 +66,35 @@ def load_config():
         print("Manager: Config Read Failed after 5 retries.")
         return False
     return bool(config)
+
+def save_trade_memory():
+    """Saves active tickets and their AI metadata to disk to survive crashes."""
+    try:
+        memory_state = {
+            "tracked_tickets": tracked_tickets,
+            "trade_metadata": trade_metadata,
+            "trade_mfe_mae": trade_mfe_mae
+        }
+        with open(MEMORY_FILE, "w") as f:
+            json.dump(memory_state, f, indent=4)
+    except Exception as e:
+        print(f"Manager: Failed to save trade memory: {e}")
+
+def load_trade_memory():
+    """Restores active tickets and metadata from disk on startup."""
+    global tracked_tickets, trade_metadata, trade_mfe_mae
+    if not os.path.exists(MEMORY_FILE): return
+    
+    try:
+        with open(MEMORY_FILE, "r") as f:
+            memory_state = json.load(f)
+            # JSON converts integer dictionary keys to strings, so we must convert them back
+            tracked_tickets = {int(k): v for k, v in memory_state.get("tracked_tickets", {}).items()}
+            trade_metadata = {int(k): v for k, v in memory_state.get("trade_metadata", {}).items()}
+            trade_mfe_mae = {int(k): v for k, v in memory_state.get("trade_mfe_mae", {}).items()}
+        print(f"Manager: Restored {len(tracked_tickets)} active tickets from memory.")
+    except Exception as e:
+        print(f"Manager: Failed to load trade memory: {e}")
 
 def connect_mt5():
     if not config:
@@ -624,6 +654,7 @@ def run_manager():
     print(f"--- Manager Listening on Port {zmq_port} ---")
     
     db.initialize()
+    load_trade_memory()
     sync_positions_on_startup()
 
     while True:

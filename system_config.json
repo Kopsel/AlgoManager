@@ -49,8 +49,8 @@
         "max_confidence": 1.0,
         "atr_period": 14,
         "atr_timeframe": "M5",
-        "min_atr_multiplier": 0.75,
-        "max_atr_multiplier": 3.0,
+        "min_atr_multiplier": 1.5,
+        "max_atr_multiplier": 6.0,
         "fallback_step_points": 3.0
       }
     }

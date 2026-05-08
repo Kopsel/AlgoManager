@@ -241,11 +241,23 @@ def check_closed_trades():
                 "mfe": mfe_val,
                 "mae": mae_val
             }
-            db.log_trade(trade_record)
             
-            del tracked_tickets[ticket]
-            if ticket in trade_metadata: del trade_metadata[ticket]
-            if ticket in trade_mfe_mae: del trade_mfe_mae[ticket]
+            # --- FIX: ISOLATE DB ERROR AND FORCE MEMORY CLEANUP ---
+            try:
+                db.log_trade(trade_record)
+            except Exception as e:
+                if "UNIQUE" in str(e):
+                    print(f"Manager: Trade {ticket} was already logged. Skipping.")
+                else:
+                    print(f"Manager: DB Warning (Log Trade): {e}")
+            finally:
+                # Always safely delete it from RAM so we don't get stuck in a loop
+                if ticket in tracked_tickets: del tracked_tickets[ticket]
+                if ticket in trade_metadata: del trade_metadata[ticket]
+                if ticket in trade_mfe_mae: del trade_mfe_mae[ticket]
+                
+                # Immediately write the clean state to disk
+                save_trade_memory()
 
 def close_all_positions(reason="Global Basket Trigger"):
     positions = mt5.positions_get()

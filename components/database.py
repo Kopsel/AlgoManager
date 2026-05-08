@@ -33,14 +33,14 @@ class Database:
         finally: conn.close()
 
     def insert_ml_snapshot(self, strategy_id, symbol, timestamp_ms, payload, explicit_id=None):
+        conn = self.get_connection()
         try:
-            conn = self.get_connection()
             c = conn.cursor()
             json_str = json.dumps(payload)
             
             if explicit_id:
                 c.execute("""
-                    INSERT INTO ml_features (id, strategy_id, symbol, timestamp, features_json)
+                    INSERT OR IGNORE INTO ml_features (id, strategy_id, symbol, timestamp, features_json)
                     VALUES (?, ?, ?, ?, ?)
                 """, (explicit_id, strategy_id, symbol, timestamp_ms, json_str))
                 inserted_id = explicit_id
@@ -52,18 +52,20 @@ class Database:
                 inserted_id = c.lastrowid
                 
             conn.commit()
-            conn.close()
             return inserted_id
         except Exception as e:
             print(f"Database Error (Insert ML): {e}")
             return None
+        finally:
+            conn.close() # GUARANTEED TO UNLOCK DB
 
     def log_trade(self, trade_data):
+        conn = self.get_connection()
         try:
-            conn = self.get_connection()
             c = conn.cursor()
+            # USE INSERT OR IGNORE TO NATIVELY BYPASS UNIQUE GHOST TICKETS
             c.execute("""
-                INSERT INTO trades (
+                INSERT OR IGNORE INTO trades (
                     ticket, ml_feature_id, strategy_id, symbol, action, 
                     open_time, close_time, duration_sec, open_price, close_price, 
                     sl, tp, pnl, pnl_points, commission, swap, close_reason, mfe, mae
@@ -77,13 +79,14 @@ class Database:
                 trade_data['reason'], trade_data.get('mfe', 0.0), trade_data.get('mae', 0.0)
             ))
             conn.commit()
-            conn.close()
         except Exception as e:
             print(f"Database Error (Log Trade): {e}")
+        finally:
+            conn.close() # GUARANTEED TO UNLOCK DB
 
     def log_equity_snapshot(self, balance, equity, open_positions, strategy_pl_dict):
+        conn = self.get_connection()
         try:
-            conn = self.get_connection()
             c = conn.cursor()
             strat_json = json.dumps(strategy_pl_dict)
             c.execute("""
@@ -91,27 +94,28 @@ class Database:
                 VALUES (?, ?, ?, ?, ?)
             """, (datetime.now(), balance, equity, open_positions, strat_json))
             conn.commit()
-            conn.close()
         except Exception as e:
             print(f"Database Error (Log Equity): {e}")
+        finally:
+            conn.close() # GUARANTEED TO UNLOCK DB
 
     def fetch_recent_trades_with_features(self, limit=50, strategy_id=None):
         conn = self.get_connection()
-        c = conn.cursor()
-        
-        query = '''
-            SELECT t.*, m.features_json 
-            FROM trades t
-            LEFT JOIN ml_features m ON t.ml_feature_id = m.id
-        '''
-        params = []
-        if strategy_id:
-            query += " WHERE t.strategy_id = ?"
-            params.append(strategy_id)
-        query += " ORDER BY t.close_time DESC LIMIT ?"
-        params.append(limit)
-        
         try:
+            c = conn.cursor()
+            
+            query = '''
+                SELECT t.*, m.features_json 
+                FROM trades t
+                LEFT JOIN ml_features m ON t.ml_feature_id = m.id
+            '''
+            params = []
+            if strategy_id:
+                query += " WHERE t.strategy_id = ?"
+                params.append(strategy_id)
+            query += " ORDER BY t.close_time DESC LIMIT ?"
+            params.append(limit)
+            
             c.execute(query, params)
             rows = c.fetchall()
             results = []
@@ -124,12 +128,12 @@ class Database:
                     feat = json.loads(d['features_json'])
                     trigger = feat.get('trigger', {})
                     context = feat.get('context', {})
-                    ai_dec = feat.get('ai_decision', {}) # --- NEW ---
+                    ai_dec = feat.get('ai_decision', {})
                     
                     pseudo_meta['speed'] = trigger.get('speed_delta')
                     pseudo_meta['absorption'] = trigger.get('absorption_ratio')
                     pseudo_meta['vwap_dist'] = context.get('vwap_dist_pct')
-                    pseudo_meta['confidence'] = ai_dec.get('confidence', 0.0) * 100 # --- NEW ---
+                    pseudo_meta['confidence'] = ai_dec.get('confidence', 0.0) * 100 
                 
                 d['meta_json'] = pseudo_meta
                 if 'features_json' in d: del d['features_json']
@@ -147,8 +151,8 @@ class Database:
 
     def fetch_equity_history(self, limit=2880):
         conn = self.get_connection()
-        c = conn.cursor()
         try:
+            c = conn.cursor()
             c.execute("SELECT * FROM equity_history ORDER BY timestamp DESC LIMIT ?", (limit,))
             return c.fetchall()
         except Exception as e:
@@ -158,19 +162,20 @@ class Database:
             conn.close()
 
     def log_regime(self, timestamp, regime, name):
+        conn = self.get_connection()
         try:
-            conn = self.get_connection()
             c = conn.cursor()
             c.execute("INSERT INTO regime_history VALUES (?, ?, ?)", (timestamp, regime, name))
             conn.commit()
-            conn.close()
         except Exception as e:
             print(f"Database Error (Log Regime): {e}")
+        finally:
+            conn.close()
 
     def fetch_regimes(self, limit=300):
         conn = self.get_connection()
-        c = conn.cursor()
         try:
+            c = conn.cursor()
             c.execute("SELECT * FROM regime_history ORDER BY timestamp DESC LIMIT ?", (limit,))
             rows = c.fetchall()
             return [dict(row) for row in rows]
